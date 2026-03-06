@@ -1,0 +1,24 @@
+{
+  "name": "obsidian-confluence-plugin",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "Two-way sync between Obsidian vault directories and Confluence spaces",
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "^0.27.3",
+    "obsidian": "^1.12.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

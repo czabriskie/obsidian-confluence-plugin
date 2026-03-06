@@ -1,0 +1,28 @@
+{
+    "compilerOptions": {
+        "baseUrl": ".",
+        "inlineSourceMap": true,
+        "inlineSources": true,
+        "module": "ESNext",
+        "target": "ES2022",
+        "allowSyntheticDefaultImports": true,
+        "moduleResolution": "bundler",
+        "isolatedModules": true,
+        "strictNullChecks": true,
+        "lib": [
+            "ES2022",
+            "DOM"
+        ],
+        "outDir": "dist",
+        "types": [
+            "node"
+        ]
+    },
+    "include": [
+        "**/*.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist"
+    ]
+}

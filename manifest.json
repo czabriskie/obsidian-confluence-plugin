@@ -1,0 +1,10 @@
+{
+    "id": "obsidian-confluence-plugin",
+    "name": "Confluence Sync",
+    "version": "1.0.0",
+    "minAppVersion": "0.15.0",
+    "description": "Two-way sync between Obsidian vault directories and Confluence spaces",
+    "author": "Your Name",
+    "authorUrl": "",
+    "isDesktopOnly": true
+}
