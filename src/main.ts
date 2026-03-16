@@ -81,6 +81,19 @@ export default class ConfluenceSyncPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: "confluence-force-push-current",
+            name: "Force push current file to Confluence (ignore cached hash)",
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== "md") return false;
+                if (!checking) {
+                    this.pushCurrentFile(file, true);
+                }
+                return true;
+            },
+        });
+
+        this.addCommand({
             id: "confluence-reset-sync-state",
             name: "Reset sync state (re-sync everything on next run)",
             callback: async () => {
@@ -298,7 +311,7 @@ export default class ConfluenceSyncPlugin extends Plugin {
         }
     }
 
-    private async pushCurrentFile(file: TFile): Promise<void> {
+    private async pushCurrentFile(file: TFile, force = false): Promise<void> {
         const client = this.getClient();
         if (!client) {
             new Notice("⚠️ Confluence Sync: Configure your Confluence settings first.");
@@ -309,18 +322,19 @@ export default class ConfluenceSyncPlugin extends Plugin {
             this.app.vault,
             client,
             this.stateManager,
-            { ...this.settings, syncDirection: "push" }
+            this.settings
         );
 
-        new Notice(`🔄 Pushing ${file.basename}…`);
+        new Notice(`🔄 ${force ? "Force pushing" : "Pushing"} ${file.basename}…`);
         try {
-            // Only sync the single file by temporarily restricting the vault dir
-            const result = await engine.sync();
-            new Notice(
-                result.errors.length
-                    ? `❌ Push failed: ${result.errors[0].error}`
-                    : `✅ Pushed ${file.basename} to Confluence`
-            );
+            const result = await engine.pushFileDirect(file, force);
+            if (result.errors.length) {
+                new Notice(`❌ Push failed: ${result.errors[0].error}`);
+            } else if (result.pushed.length === 0) {
+                new Notice(`⏭️ ${file.basename} is already up to date`);
+            } else {
+                new Notice(`✅ Pushed ${file.basename} to Confluence`);
+            }
         } catch (e) {
             new Notice(`❌ Push failed: ${e}`);
         }

@@ -19,6 +19,24 @@ function escapeXmlText(text: string): string {
         .replace(/>/g, "&gt;");
 }
 
+/** Image file extensions treated as embeddable attachments. */
+const IMAGE_EXTENSIONS = /\.(png|jpg|jpeg|gif|svg|webp|bmp|ico)$/i;
+
+/**
+ * Returns the unique list of image filenames embedded via ![[...]] syntax.
+ * These need to be uploaded as Confluence attachments before or after the page push.
+ */
+export function extractEmbeddedImages(markdown: string): string[] {
+    const seen = new Set<string>();
+    const re = /!\[\[([^\]]+)\]\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(markdown)) !== null) {
+        const name = m[1].trim();
+        if (IMAGE_EXTENSIONS.test(name)) seen.add(name);
+    }
+    return [...seen];
+}
+
 export function markdownToConfluenceStorage(markdown: string): string {
     let html = markdown;
 
@@ -30,7 +48,11 @@ export function markdownToConfluenceStorage(markdown: string): string {
     html = html.replace(/^> \[!(\w+)\]\s*(.*)/gm, (_, type, title) =>
         `> **${type}${title ? ": " + title : ""}**`
     );
-    // Embedded files: ![[file]] → remove entirely
+    // Embedded images: ![[image.png]] → Confluence attachment macro (placeholder resolved after upload)
+    html = html.replace(/!\[\[([^\]]+\.(png|jpg|jpeg|gif|svg|webp|bmp|ico))\]\]/gi,
+        (_, filename) => `<ac:image><ri:attachment ri:filename="${filename}"/></ac:image>`
+    );
+    // Other embedded files (non-image): remove entirely
     html = html.replace(/!\[\[[^\]]*\]\]/g, "");
     // Wiki links with file extensions: [[File.ext|Alias]] or [[File.ext]] → just alias/filename without ext
     html = html.replace(/\[\[([^\]|]+\.[a-zA-Z0-9]+)\s*\|([^\]]+)\]\]/g, "$2");
@@ -56,14 +78,21 @@ export function markdownToConfluenceStorage(markdown: string): string {
     html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
     html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
 
-    // Code blocks (fenced)
+    // Code blocks (fenced).
+    // The language token after the opening ``` may be:
+    //   - absent          → ```\n
+    //   - a single word   → ```bash\n
+    //   - a multi-word string like "aws s3api ..." (when the user types the
+    //     command inline after the fence) → treat the whole first line as the
+    //     language hint but only store the first word as the language param.
     html = html.replace(
-        /```(\w*)\n([\s\S]*?)```/g,
-        (_, lang, code) => {
-            const language = lang || "none";
+        /^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm,
+        (_, langLine, code) => {
+            // Use only the first whitespace-delimited token as the language identifier
+            const lang = langLine.trim().split(/\s+/)[0] ?? "";
             return (
                 `<ac:structured-macro ac:name="code">` +
-                (lang ? `<ac:parameter ac:name="language">${language}</ac:parameter>` : "") +
+                (lang ? `<ac:parameter ac:name="language">${escapeXmlText(lang)}</ac:parameter>` : "") +
                 `<ac:plain-text-body><![CDATA[${code}]]></ac:plain-text-body>` +
                 `</ac:structured-macro>`
             );
@@ -124,13 +153,24 @@ export function markdownToConfluenceStorage(markdown: string): string {
         '<a href="$2">$1</a>'
     );
 
-    // Paragraphs: wrap lines that are not already known block tags
+    // Paragraphs: wrap lines that are not already known block tags.
+    // Lines inside a CDATA section (code macro bodies) must be left untouched.
     const BLOCK_TAG = /^<(h[1-6]|p|ul|ol|li|blockquote|hr|ac:|pre|div|table|tr|td|th)([\s>\/]|$)/i;
     const HAS_HTML = /<[a-zA-Z/]/;
     const lines = html.split("\n");
     const output: string[] = [];
+    let insideCdata = false;
 
     for (const line of lines) {
+        // Track entry/exit of CDATA sections so we never wrap their content
+        if (!insideCdata && line.includes("<![CDATA[")) insideCdata = true;
+
+        if (insideCdata) {
+            output.push(line);
+            if (line.includes("]]>")) insideCdata = false;
+            continue;
+        }
+
         const trimmed = line.trim();
         if (BLOCK_TAG.test(trimmed)) {
             output.push(line);
@@ -155,10 +195,17 @@ export function markdownToConfluenceStorage(markdown: string): string {
 export function confluenceStorageToMarkdown(storage: string): string {
     let md = storage;
 
-    // Code macro
+    // Code macro — Confluence may emit parameters in any order and with extra
+    // attributes, so we extract the language param separately if present.
     md = md.replace(
-        /<ac:structured-macro ac:name="code"[^>]*>(?:<ac:parameter ac:name="language">(\w+)<\/ac:parameter>)?<ac:plain-text-body><!\[CDATA\[([\s\S]*?)\]\]><\/ac:plain-text-body><\/ac:structured-macro>/g,
-        (_, lang, code) => "```" + (lang || "") + "\n" + code + "```"
+        /<ac:structured-macro ac:name="code"[^>]*>([\s\S]*?)<\/ac:structured-macro>/g,
+        (_, inner) => {
+            const langMatch = inner.match(/<ac:parameter ac:name="language">([^<]+)<\/ac:parameter>/);
+            const lang = langMatch ? langMatch[1].trim() : "";
+            const cdataMatch = inner.match(/<ac:plain-text-body><!\[CDATA\[([\s\S]*?)\]\]><\/ac:plain-text-body>/);
+            const code = cdataMatch ? cdataMatch[1] : "";
+            return "```" + lang + "\n" + code + "```";
+        }
     );
 
     // Headings

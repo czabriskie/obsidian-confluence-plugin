@@ -14,6 +14,7 @@ import { ConfluenceClient, ConfluencePage } from "./confluenceClient";
 import {
     markdownToConfluenceStorage,
     confluenceStorageToMarkdown,
+    extractEmbeddedImages,
 } from "./converter";
 import { SyncStateManager, SyncRecord } from "./syncStateManager";
 import { ConfluenceSyncSettings } from "./settings";
@@ -26,6 +27,14 @@ export interface SyncResult {
     pulled: string[];
     conflicts: string[];
     errors: Array<{ path: string; error: string }>;
+}
+
+/** Sentinel error thrown when a folder page's parent no longer exists in Confluence. */
+class StaleFolderError extends Error {
+    constructor(public readonly segment: string, public readonly staleParentId: string | undefined) {
+        super(`Stale folder parent ${staleParentId} for segment "${segment}"`);
+        this.name = "StaleFolderError";
+    }
 }
 
 export class SyncEngine {
@@ -142,7 +151,8 @@ export class SyncEngine {
 
     private async pushFile(
         file: TFile,
-        result: SyncResult
+        result: SyncResult,
+        force = false
     ): Promise<boolean> {
         const content = await this.vault.read(file);
         const record = this.state.get(file.path);
@@ -195,6 +205,7 @@ export class SyncEngine {
                     lastSyncedAt: new Date().toISOString(),
                     contentHash: SyncStateManager.hash(page.body),
                 });
+                await this.uploadPageImages(page.id, content, file);
                 return true;
             }
         }
@@ -235,6 +246,14 @@ export class SyncEngine {
             try {
                 page = await this.client.createPage(title, storageBody, expectedParentId);
             } catch (e: any) {
+                // Stale folder parent — evict and retry so the hierarchy is rebuilt.
+                if (this.isParentNotExistError(e) || e instanceof StaleFolderError) {
+                    this.evictStaleFolderEntries(expectedParentId);
+                    console.warn(
+                        `[ConfluenceSync] Parent page deleted for "${file.path}" — evicting stale folder entries and retrying`
+                    );
+                    return this.pushFile(file, result);
+                }
                 // Title collision – a page with this name already exists in the space.
                 // Find it and link it to this local file instead of failing.
                 if (String(e).includes("already exists")) {
@@ -263,10 +282,9 @@ export class SyncEngine {
                 lastSyncedAt: new Date().toISOString(),
                 contentHash: SyncStateManager.hash(page.body),
             });
+            await this.uploadPageImages(page.id, content, file);
             return true;
         }
-
-        // Existing record – check content changerkdown converted to storage
         // against the stored hash (which is always a storage-body hash).
         const storageBodyForCheck = markdownToConfluenceStorage(content);
         const storageHash = SyncStateManager.hash(storageBodyForCheck);
@@ -292,7 +310,7 @@ export class SyncEngine {
             && expectedParentId !== undefined
             && expectedParentId !== record.confluenceParentId;
 
-        if (!localChanged && !needsReparent) {
+        if (!localChanged && !needsReparent && !force) {
             // Lazily backfill confluenceParentId if it was missing
             if (record.confluenceParentId === undefined) {
                 try {
@@ -342,13 +360,32 @@ export class SyncEngine {
 
         const storageBody = markdownToConfluenceStorage(content);
         const title = this.titleFromFile(file);
-        const page = await this.client.updatePage(
-            record.confluencePageId,
-            title,
-            storageBody,
-            remotePage.version,
-            needsReparent ? expectedParentId : (remotePage.parentId ?? record.confluenceParentId)
-        );
+        let page;
+        try {
+            page = await this.client.updatePage(
+                record.confluencePageId,
+                title,
+                storageBody,
+                remotePage.version,
+                needsReparent ? expectedParentId : (remotePage.parentId ?? record.confluenceParentId)
+            );
+        } catch (e: any) {
+            // The parent page no longer exists on Confluence (e.g. a folder page
+            // was deleted).  Evict all stale folderMap entries, clear this file's
+            // record, and retry so the folder hierarchy gets recreated.
+            if (this.isParentNotExistError(e) || e instanceof StaleFolderError) {
+                const parentId = needsReparent
+                    ? expectedParentId
+                    : (remotePage.parentId ?? record.confluenceParentId);
+                this.evictStaleFolderEntries(parentId);
+                this.state.delete(file.path);
+                console.warn(
+                    `[ConfluenceSync] Parent page deleted for "${file.path}" — evicting stale folder entries and retrying`
+                );
+                return this.pushFile(file, result);
+            }
+            throw e;
+        }
         this.state.set(file.path, {
             confluencePageId: page.id,
             confluenceTitle: page.title,
@@ -357,7 +394,73 @@ export class SyncEngine {
             lastSyncedAt: new Date().toISOString(),
             contentHash: SyncStateManager.hash(page.body),
         });
+        await this.uploadPageImages(page.id, content, file);
         return true;
+    }
+
+    /**
+     * Force-push a single file regardless of whether the content hash has changed.
+     * Useful when the converter has been fixed and the stored hash is stale.
+     */
+    async pushFileDirect(file: TFile, force = false): Promise<SyncResult> {
+        this._foundFolderCache.clear();
+        const result: SyncResult = { pushed: [], pulled: [], conflicts: [], errors: [] };
+        try {
+            if (force) {
+                const existing = this.state.get(file.path);
+                console.log(`[ConfluenceSync] Force push: file="${file.path}", hasRecord=${!!existing}, pageId=${existing?.confluencePageId}`);
+                if (existing) {
+                    const content = await this.vault.read(file);
+                    const storageBody = markdownToConfluenceStorage(content);
+                    console.log(`[ConfluenceSync] Force push: fetching remote page ${existing.confluencePageId}`);
+                    let remotePage;
+                    try {
+                        remotePage = await this.client.getPage(existing.confluencePageId);
+                    } catch (e: any) {
+                        if (String(e).includes("404") || String(e).includes("not found") || String(e).includes("NotFoundException")) {
+                            console.log(`[ConfluenceSync] Force push: remote page deleted, clearing record and recreating`);
+                            this.state.delete(file.path);
+                            const pushed = await this.pushFile(file, result, false);
+                            if (pushed) result.pushed.push(file.path);
+                            await this.state.save();
+                            return result;
+                        }
+                        throw e;
+                    }
+                    console.log(`[ConfluenceSync] Force push: calling updatePage v${remotePage.version}`);
+                    const page = await this.client.updatePage(
+                        existing.confluencePageId,
+                        existing.confluenceTitle,
+                        storageBody,
+                        remotePage.version,
+                        remotePage.parentId
+                    );
+                    console.log(`[ConfluenceSync] Force push: success, new version ${page.version}`);
+                    this.state.set(file.path, {
+                        confluencePageId: page.id,
+                        confluenceTitle: page.title,
+                        confluenceVersion: page.version,
+                        confluenceParentId: page.parentId,
+                        lastSyncedAt: new Date().toISOString(),
+                        contentHash: SyncStateManager.hash(page.body),
+                    });
+                    await this.uploadPageImages(page.id, content, file);
+                    result.pushed.push(file.path);
+                } else {
+                    console.log(`[ConfluenceSync] Force push: no record, creating new page`);
+                    const pushed = await this.pushFile(file, result, false);
+                    if (pushed) result.pushed.push(file.path);
+                }
+            } else {
+                const pushed = await this.pushFile(file, result, false);
+                if (pushed) result.pushed.push(file.path);
+            }
+        } catch (e) {
+            console.error(`[ConfluenceSync] Force push error:`, e);
+            result.errors.push({ path: file.path, error: String(e) });
+        }
+        await this.state.save();
+        return result;
     }
 
     // ── Remote → Local ────────────────────────────────────────────────────
@@ -698,7 +801,7 @@ export class SyncEngine {
         for (const segment of segments) {
             accumulatedPath = normalizePath(`${accumulatedPath}/${segment}`);
 
-            // Check if we already have a Confluence page for this folder
+            // Check if we already have a Confluence page for this folder.
             // Prefer the persistent folderMap (pages we created), then the transient
             // found-cache, so that found-but-not-created folders don't end up in the
             // persistent store and don't pollute pull's "known folder" set.
@@ -734,12 +837,29 @@ export class SyncEngine {
                 continue;
             }
 
-            // Create the folder page with empty body
-            const folderPage = await this.client.createPage(
-                segment,
-                "<p></p>",
-                currentParentId
-            );
+            // Create the folder page with empty body.
+            // If Confluence rejects the create because the parent no longer exists
+            // (e.g. it was deleted), evict the stale ID from folderMap and the
+            // transient cache and throw a typed error so pushFile can retry.
+            let folderPage;
+            try {
+                folderPage = await this.client.createPage(
+                    segment,
+                    "<p></p>",
+                    currentParentId
+                );
+            } catch (e: any) {
+                if (this.isParentNotExistError(e)) {
+                    // Evict every folderMap entry that points to the stale parent ID
+                    // so the next attempt re-discovers / re-creates those pages.
+                    this.evictStaleFolderEntries(currentParentId);
+                    console.warn(
+                        `[ConfluenceSync] Stale folder parent ID ${currentParentId} evicted — will retry`
+                    );
+                    throw new StaleFolderError(segment, currentParentId);
+                }
+                throw e;
+            }
             // Store in the persistent folderMap — we OWN this page.
             this.state.setFolder(accumulatedPath, folderPage.id);
             currentParentId = folderPage.id;
@@ -842,11 +962,80 @@ export class SyncEngine {
         await recurse(rootFolder);
     }
 
+    /** Returns true if the error message indicates a missing/inaccessible parent page. */
+    private isParentNotExistError(e: unknown): boolean {
+        const msg = String(e).toLowerCase();
+        return (
+            msg.includes("does not exist") ||
+            msg.includes("parent id") ||
+            msg.includes("parentid") ||
+            msg.includes("parent page") ||
+            // Confluence REST API returns 400 with this message
+            msg.includes("the parent id specified does not exist")
+        );
+    }
+
+    /**
+     * Evict all folderMap entries whose stored Confluence page ID matches
+     * `staleId`, plus any transient cache entries.  Called when Confluence
+     * signals that a parent page no longer exists so that the next resolve
+     * attempt re-discovers or re-creates the folder page fresh.
+     */
+    private evictStaleFolderEntries(staleId: string | undefined): void {
+        if (!staleId) return;
+        for (const [dirPath, pageId] of Object.entries(this.state.allFolders())) {
+            if (pageId === staleId) {
+                this.state.deleteFolder(dirPath);
+                console.warn(`[ConfluenceSync] Evicted stale folderMap entry: ${dirPath} → ${pageId}`);
+            }
+        }
+        for (const [dirPath, pageId] of this._foundFolderCache.entries()) {
+            if (pageId === staleId) {
+                this._foundFolderCache.delete(dirPath);
+            }
+        }
+    }
+
     /** Returns true if the given vault-relative path is excluded from sync. */
     private isExcluded(path: string): boolean {
         const excluded: string[] = (this.settings as any).excludedPaths ?? [];
         return excluded.some(
             (ex: string) => path === ex || path.startsWith(ex + "/")
         );
+    }
+
+    /**
+     * Upload all images embedded in `markdown` as attachments on `pageId`.
+     * Silently skips images that cannot be found in the vault.
+     */
+    private async uploadPageImages(pageId: string, markdown: string, sourceFile: TFile): Promise<void> {
+        const imageFilenames = extractEmbeddedImages(markdown);
+        if (imageFilenames.length === 0) return;
+
+        for (const filename of imageFilenames) {
+            // Search the vault for the image file by name
+            const imageFile = this.vault.getFiles().find(
+                (f) => f.name === filename || f.path === filename
+            );
+            if (!imageFile) {
+                console.warn(`[ConfluenceSync] Image not found in vault: ${filename}`);
+                continue;
+            }
+
+            try {
+                const data = await this.vault.readBinary(imageFile);
+                const ext = imageFile.extension.toLowerCase();
+                const mimeTypes: Record<string, string> = {
+                    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+                    gif: "image/gif", svg: "image/svg+xml", webp: "image/webp",
+                    bmp: "image/bmp", ico: "image/x-icon",
+                };
+                const mimeType = mimeTypes[ext] ?? "application/octet-stream";
+                await this.client.uploadAttachment(pageId, imageFile.name, data, mimeType);
+                console.log(`[ConfluenceSync] Uploaded attachment: ${imageFile.name} → page ${pageId}`);
+            } catch (e) {
+                console.error(`[ConfluenceSync] Failed to upload attachment ${filename}:`, e);
+            }
+        }
     }
 }

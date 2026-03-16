@@ -315,6 +315,74 @@ export class ConfluenceClient {
         await this.request<void>(`/content/${pageId}`, { method: "DELETE" });
     }
 
+    /**
+     * Upload a file as an attachment on a Confluence page.
+     * If an attachment with the same filename already exists it is replaced.
+     * Returns the attachment ID.
+     */
+    async uploadAttachment(pageId: string, filename: string, data: ArrayBuffer, mimeType: string): Promise<string> {
+        // requestUrl mangles the multipart Content-Type boundary and fetch() is
+        // blocked by CORS. Use Node's built-in https module directly — it is
+        // available in Electron and sends headers exactly as specified.
+        const https = require("https") as typeof import("https");
+        const { URL } = require("url") as typeof import("url");
+
+        const endpoint = new URL(
+            `${this.baseUrl}/rest/api/content/${pageId}/child/attachment`
+        );
+
+        const boundary = `ConfluenceBoundary${Date.now()}`;
+        const CRLF = "\r\n";
+        const encoder = new TextEncoder();
+
+        const partHeader = encoder.encode(
+            `--${boundary}${CRLF}` +
+            `Content-Disposition: form-data; name="file"; filename="${filename}"${CRLF}` +
+            `Content-Type: ${mimeType}${CRLF}${CRLF}`
+        );
+        const partFooter = encoder.encode(`${CRLF}--${boundary}--${CRLF}`);
+        const fileBytes = new Uint8Array(data);
+
+        const bodyBytes = new Uint8Array(partHeader.length + fileBytes.length + partFooter.length);
+        bodyBytes.set(partHeader, 0);
+        bodyBytes.set(fileBytes, partHeader.length);
+        bodyBytes.set(partFooter, partHeader.length + fileBytes.length);
+
+        const responseText = await new Promise<string>((resolve, reject) => {
+            const req = https.request(
+                {
+                    hostname: endpoint.hostname,
+                    port: 443,
+                    path: endpoint.pathname + endpoint.search,
+                    method: "POST",
+                    headers: {
+                        Authorization: this.authHeader,
+                        "X-Atlassian-Token": "no-check",
+                        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                        "Content-Length": bodyBytes.length,
+                    },
+                },
+                (res) => {
+                    let body = "";
+                    res.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+                    res.on("end", () => {
+                        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                            resolve(body);
+                        } else {
+                            reject(new Error(`Confluence attachment upload error ${res.statusCode}: ${body}`));
+                        }
+                    });
+                }
+            );
+            req.on("error", reject);
+            req.write(Buffer.from(bodyBytes));
+            req.end();
+        });
+
+        const json = JSON.parse(responseText) as { results?: Array<{ id: string }> };
+        return json.results?.[0]?.id ?? "";
+    }
+
     /** Retrieve a space by key to validate connectivity. */
     async getSpace(): Promise<ConfluenceSpace> {
         const data = await this.request<{
