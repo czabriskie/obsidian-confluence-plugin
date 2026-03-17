@@ -61,6 +61,17 @@ function applyOutsideCdata(input: string, fn: (s: string) => string): string {
     return parts.map((part, i) => (i % 2 === 0 ? fn(part) : part)).join("");
 }
 
+/**
+ * Escape XML special characters in a string that may contain HTML tags.
+ * Only text nodes (content between tags) are escaped; tag markup is left intact.
+ */
+function escapeXmlTextNodes(html: string): string {
+    // Split on HTML tags, escape only the text segments (even-indexed parts)
+    return html.split(/(<[^>]+>)/).map((part, i) =>
+        i % 2 === 0 ? escapeXmlText(part) : part
+    ).join("");
+}
+
 function convertTables(input: string): string {
     // Collect contiguous pipe-delimited lines (ignoring blank lines within the block)
     // A table block is a sequence of lines where EVERY non-blank line starts with |
@@ -165,7 +176,9 @@ function convertLists(input: string): string {
                     }
 
                     // Peek ahead: if the next item is deeper, build a sublist
-                    let liContent = escapeXmlText(item.text);
+                    // Item text may already contain inline HTML (strong, code, em)
+                    // from earlier passes — escape only text nodes, not the tags.
+                    let liContent = escapeXmlTextNodes(item.text);
                     let j = i + 1;
                     if (j < items.length && items[j].indent > item.indent) {
                         const [subList, nextIdx] = buildList(j, items[j].indent);
@@ -316,8 +329,9 @@ export function markdownToConfluenceStorage(markdown: string): string {
         } else if (trimmed === "") {
             output.push("");
         } else if (HAS_HTML.test(trimmed)) {
-            // Line already has inline HTML tags (strong, em, a, code, etc.) — wrap as-is
-            output.push(`<p>${trimmed}</p>`);
+            // Line has inline HTML tags (strong, em, a, code, etc.) mixed with text.
+            // Escape only the text nodes, leaving the tags intact.
+            output.push(`<p>${escapeXmlTextNodes(trimmed)}</p>`);
         } else {
             // Plain text — escape XML special chars
             output.push(`<p>${escapeXmlText(trimmed)}</p>`);

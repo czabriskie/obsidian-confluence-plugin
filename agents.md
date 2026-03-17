@@ -104,16 +104,32 @@ Key transformations (in order):
 3. `![[image.png]]` → `<ac:image><ri:attachment ri:filename="..."/></ac:image>`
 4. Other `![[...]]` embeds → deleted
 5. Wiki links (`[[Page|Alias]]`, `[[File.ext]]`) → plain text
-6. Headings, bold, italic, strikethrough
+6. Headings
 7. Code fences → `<ac:structured-macro ac:name="code">` with CDATA
    - Regex: `/^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm` (captures full first line, uses first token as language)
-8. Inline code → `<code>`
-9. Links → `<a href="...">`
-10. Horizontal rules → `<hr/>`
-11. Blockquotes → `<blockquote>`
-12. Tables → `<table>` with `<th>`/`<td>`
-13. Unordered/ordered lists → `<ul>`/`<ol>` (handles nesting by indentation)
-14. Paragraphs — **skips lines inside `<![CDATA[...]]>` blocks** to avoid wrapping code block content in `<p>` tags
+8. **Tables** (`convertTables`) — runs here, before inline passes, so pipe chars and backtick/bold cell content aren't pre-converted
+   - Header row → `<thead><tr><th>` cells; separator row (`|---|`) skipped; data rows → `<tbody><tr><td>`
+   - Backtick-wrapped cell values have backticks stripped (rendered as plain text)
+   - Wrapped in `applyOutsideCdata()` so pipe chars inside code blocks are safe
+9. Inline code → `<code>`
+10. Bold, italic, strikethrough
+11. Horizontal rules → `<hr/>`
+12. Blockquotes → `<blockquote>`
+13. **Lists** (`convertLists`) — nested `<ul>`/`<ol>` built recursively from indentation depth
+    - Wrapped in `applyOutsideCdata()` so `- item` lines inside code blocks are not converted
+    - Item text uses `escapeXmlTextNodes()` (not `escapeXmlText`) so inline HTML tags already present from bold/code passes are preserved
+14. Links → `<a href="...">`
+15. Paragraphs — wraps remaining lines in `<p>`:
+    - Skips lines inside `<![CDATA[...]]>` blocks
+    - Lines with inline HTML use `escapeXmlTextNodes()` to escape only text nodes, preserving `<strong>`, `<code>`, `<a>` etc.
+    - Plain-text lines use `escapeXmlText()`
+
+**Helper functions:**
+- `applyOutsideCdata(input, fn)` — splits on CDATA boundaries, applies `fn` only to non-CDATA segments, reassembles. Used by `convertTables` and `convertLists` to prevent processing content inside code blocks.
+- `escapeXmlText(text)` — escapes `&`, `<`, `>` in plain text strings.
+- `escapeXmlTextNodes(html)` — splits on `(<[^>]+>)` boundaries, escapes only the text segments. Use this when the string may already contain HTML tags from prior passes.
+- `convertTables(input)` — GFM table → Confluence `<table>` with `<thead>`/`<tbody>`.
+- `convertLists(input)` — recursive nested list builder from indented markdown.
 
 **`confluenceStorageToMarkdown(html): string`**
 
