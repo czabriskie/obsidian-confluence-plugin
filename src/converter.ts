@@ -37,6 +37,157 @@ export function extractEmbeddedImages(markdown: string): string[] {
     return [...seen];
 }
 
+// ---------------------------------------------------------------------------
+// Table conversion helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts GitHub-Flavored Markdown tables (including blank-line-separated
+ * row style used by Obsidian) into Confluence storage format <table> elements.
+ *
+ * Handles:
+ *   - Header row  → <th> cells in a <thead><tr>
+ *   - Separator row (|---|---|) → skipped
+ *   - Data rows   → <td> cells in <tbody><tr>
+ *   - Blank lines between rows (Obsidian sometimes emits these)
+ */
+/**
+ * Splits input into alternating [outside-cdata, cdata, outside-cdata, ...] segments,
+ * applies `fn` only to the outside segments, then reassembles.
+ * This prevents any regex-based converter from touching content inside CDATA sections.
+ */
+function applyOutsideCdata(input: string, fn: (s: string) => string): string {
+    const parts = input.split(/(<!\[CDATA\[[\s\S]*?\]\]>)/);
+    return parts.map((part, i) => (i % 2 === 0 ? fn(part) : part)).join("");
+}
+
+function convertTables(input: string): string {
+    // Collect contiguous pipe-delimited lines (ignoring blank lines within the block)
+    // A table block is a sequence of lines where EVERY non-blank line starts with |
+    return input.replace(
+        /((?:^[ \t]*\|.+\|[ \t]*\n?(?:^[ \t]*\n)?)+)/gm,
+        (block) => {
+            // Split into non-blank pipe lines
+            const rows = block
+                .split("\n")
+                .map((l) => l.trim())
+                .filter((l) => l.startsWith("|"));
+
+            if (rows.length === 0) return block;
+
+            // Detect separator row: all cells match /^[-:]+$/
+            const isSeparator = (row: string) =>
+                row.replace(/\|/g, "").trim().replace(/[\s\-:]/g, "") === "";
+
+            // Parse a row string into cell text array.
+            // Strip backtick wrappers so `code` values render as plain text in cells.
+            const parseCells = (row: string): string[] =>
+                row
+                    .replace(/^\|/, "")
+                    .replace(/\|$/, "")
+                    .split("|")
+                    .map((c) => c.trim().replace(/`([^`]+)`/g, "$1"));
+
+            // Find header/separator split point
+            const sepIdx = rows.findIndex(isSeparator);
+            const headerRows = sepIdx > 0 ? rows.slice(0, sepIdx) : [rows[0]];
+            const dataRows = sepIdx >= 0 ? rows.slice(sepIdx + 1) : rows.slice(1);
+
+            let out = `<table><colgroup>${headerRows[0].split("|").slice(1, -1).map(() => "<col/>").join("")}</colgroup>`;
+
+            // thead
+            out += "<thead>";
+            for (const row of headerRows) {
+                out += "<tr>" + parseCells(row).map((c) => `<th><p>${escapeXmlText(c)}</p></th>`).join("") + "</tr>";
+            }
+            out += "</thead>";
+
+            // tbody
+            if (dataRows.length > 0) {
+                out += "<tbody>";
+                for (const row of dataRows) {
+                    out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlText(c)}</p></td>`).join("") + "</tr>";
+                }
+                out += "</tbody>";
+            }
+
+            out += "</table>";
+            return out;
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// List conversion helper
+// ---------------------------------------------------------------------------
+
+interface ListItem {
+    indent: number;
+    ordered: boolean;
+    text: string;
+}
+
+/**
+ * Converts markdown list blocks (possibly nested) into Confluence storage
+ * format <ul>/<ol> with proper nesting.
+ */
+function convertLists(input: string): string {
+    // Match a contiguous block of list lines (unordered or ordered, any indent)
+    return input.replace(
+        /((?:^[ \t]*(?:[-*+]|\d+\.) .+\n?)+)/gm,
+        (block) => {
+            const rawLines = block.replace(/\n$/, "").split("\n");
+            const items: ListItem[] = rawLines.map((line) => {
+                const m = line.match(/^([ \t]*)([-*+]|\d+\.) (.*)$/);
+                if (!m) return { indent: 0, ordered: false, text: line };
+                const indentStr = m[1].replace(/\t/g, "    "); // normalise tabs
+                return {
+                    indent: indentStr.length,
+                    ordered: /\d+\./.test(m[2]),
+                    text: m[3],
+                };
+            });
+
+            function buildList(startIdx: number, minIndent: number): [string, number] {
+                const firstItem = items[startIdx];
+                const tag = firstItem.ordered ? "ol" : "ul";
+                let out = `<${tag}>`;
+                let i = startIdx;
+
+                while (i < items.length && items[i].indent >= minIndent) {
+                    const item = items[i];
+                    if (item.indent > minIndent) {
+                        // Deeper indent — this becomes a nested list inside the
+                        // previous <li>. Walk back one to attach to that li.
+                        // (buildList will be called recursively from within the li)
+                        i++;
+                        continue;
+                    }
+
+                    // Peek ahead: if the next item is deeper, build a sublist
+                    let liContent = escapeXmlText(item.text);
+                    let j = i + 1;
+                    if (j < items.length && items[j].indent > item.indent) {
+                        const [subList, nextIdx] = buildList(j, items[j].indent);
+                        liContent += subList;
+                        out += `<li>${liContent}</li>`;
+                        i = nextIdx;
+                    } else {
+                        out += `<li>${liContent}</li>`;
+                        i++;
+                    }
+                }
+
+                out += `</${tag}>`;
+                return [out, i];
+            }
+
+            const [result] = buildList(0, items[0].indent);
+            return result;
+        }
+    );
+}
+
 export function markdownToConfluenceStorage(markdown: string): string {
     let html = markdown;
 
@@ -99,6 +250,12 @@ export function markdownToConfluenceStorage(markdown: string): string {
         }
     );
 
+    // Tables — must run before inline code/bold/italic so that backtick-wrapped
+    // or bold cell content isn't pre-converted into HTML tags before we parse
+    // the pipe structure. applyOutsideCdata ensures we never touch pipe chars
+    // that happen to be inside a fenced code block's CDATA section.
+    html = applyOutsideCdata(html, convertTables);
+
     // Inline code
     html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
 
@@ -119,27 +276,9 @@ export function markdownToConfluenceStorage(markdown: string): string {
     // Blockquote
     html = html.replace(/^> (.+)$/gm, "<blockquote><p>$1</p></blockquote>");
 
-    // Unordered lists — handle indented items by flattening to single level
-    html = html.replace(
-        /((?:^[ ]*[-*+] .+\n?)+)/gm,
-        (block) => {
-            const items = block.trim().split("\n")
-                .map((l) => `<li>${escapeXmlText(l.replace(/^[ ]*[-*+] /, ""))}</li>`)
-                .join("");
-            return `<ul>${items}</ul>`;
-        }
-    );
-
-    // Ordered lists — flatten indented items
-    html = html.replace(
-        /((?:^[ ]*\d+\. .+\n?)+)/gm,
-        (block) => {
-            const items = block.trim().split("\n")
-                .map((l) => `<li>${escapeXmlText(l.replace(/^[ ]*\d+\. /, ""))}</li>`)
-                .join("");
-            return `<ol>${items}</ol>`;
-        }
-    );
+    // Lists — nested unordered and ordered, respecting indentation depth.
+    // applyOutsideCdata ensures list-like lines inside code blocks are not converted.
+    html = applyOutsideCdata(html, convertLists);
 
     // Images  ![alt](url)
     html = html.replace(
@@ -155,7 +294,7 @@ export function markdownToConfluenceStorage(markdown: string): string {
 
     // Paragraphs: wrap lines that are not already known block tags.
     // Lines inside a CDATA section (code macro bodies) must be left untouched.
-    const BLOCK_TAG = /^<(h[1-6]|p|ul|ol|li|blockquote|hr|ac:|pre|div|table|tr|td|th)([\s>\/]|$)/i;
+    const BLOCK_TAG = /^<(h[1-6]|p|ul|ol|li|blockquote|hr|ac:|pre|div|table|colgroup|col|thead|tbody|tr|td|th)([ \t>\/>]|$)/i;
     const HAS_HTML = /<[a-zA-Z/]/;
     const lines = html.split("\n");
     const output: string[] = [];

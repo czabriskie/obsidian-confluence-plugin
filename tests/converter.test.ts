@@ -52,6 +52,24 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("<li>first</li>");
     });
 
+    it("converts nested unordered lists", () => {
+        const md = "- top\n  - child\n  - child2\n- other";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ul><li>top<ul><li>child</li><li>child2</li></ul></li><li>other</li></ul>");
+    });
+
+    it("converts deeply nested lists", () => {
+        const md = "- a\n  - b\n    - c\n  - d";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ul><li>a<ul><li>b<ul><li>c</li></ul></li><li>d</li></ul></li></ul>");
+    });
+
+    it("converts nested ordered lists", () => {
+        const md = "1. first\n   1. sub\n   2. sub2\n2. second";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ol><li>first<ol><li>sub</li><li>sub2</li></ol></li><li>second</li></ol>");
+    });
+
     it("converts links", () => {
         const md = "[click here](https://example.com)";
         const result = markdownToConfluenceStorage(md);
@@ -74,6 +92,29 @@ describe("markdownToConfluenceStorage", () => {
         const result = markdownToConfluenceStorage(md);
         expect(result).toContain("<blockquote>");
         expect(result).toContain("quoted text");
+    });
+
+    it("converts a simple table", () => {
+        const md = "| Key | Value |\n|---|---|\n| foo | bar |";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<table>");
+        expect(result).toContain("<thead>");
+        expect(result).toContain("<th><p>Key</p></th>");
+        expect(result).toContain("<th><p>Value</p></th>");
+        expect(result).toContain("<tbody>");
+        expect(result).toContain("<td><p>foo</p></td>");
+        expect(result).toContain("<td><p>bar</p></td>");
+    });
+
+    it("converts a table with blank-line-separated rows (Obsidian style)", () => {
+        const md = "| Key | Op | Val |\n\n|---|---|---|\n\n| arch | In | amd64 |\n\n| os | In | linux |";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<table>");
+        expect(result).toContain("<th><p>Key</p></th>");
+        expect(result).toContain("<td><p>arch</p></td>");
+        expect(result).toContain("<td><p>os</p></td>");
+        // separator row must not appear as a data row
+        expect(result).not.toContain("<td><p>---</p></td>");
     });
 
     it("escapes XML special characters in plain text", () => {
@@ -103,11 +144,11 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).not.toContain("My Page");
     });
 
-    it("strips Obsidian embeds", () => {
+    it("converts Obsidian image embeds to ac:image macro", () => {
         const md = "Check ![[embedded-file.png]] here";
         const result = markdownToConfluenceStorage(md);
         expect(result).not.toContain("![[");
-        expect(result).not.toContain("embedded-file");
+        expect(result).toContain('<ac:image><ri:attachment ri:filename="embedded-file.png"/></ac:image>');
     });
 
     it("converts Obsidian highlights to bold", () => {
