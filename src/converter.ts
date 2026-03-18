@@ -286,8 +286,20 @@ export function markdownToConfluenceStorage(markdown: string): string {
     // Horizontal rule
     html = html.replace(/^(?:---|\*\*\*|___)\s*$/gm, "<hr/>");
 
-    // Blockquote
-    html = html.replace(/^> (.+)$/gm, "<blockquote><p>$1</p></blockquote>");
+    // Blockquote — handle optional space after >, multi-line blocks, and inline HTML
+    // from prior passes (bold/code/italic). Consecutive > lines are merged into one
+    // <blockquote> so a paragraph-length quote doesn't produce multiple nested blocks.
+    html = html.replace(
+        /((?:^> ?.*\n?)+)/gm,
+        (block) => {
+            const inner = block
+                .split("\n")
+                .filter((l) => l.trim() !== "")
+                .map((l) => l.replace(/^> ?/, "").trim())
+                .join(" ");
+            return `<blockquote><p>${escapeXmlTextNodes(inner)}</p></blockquote>`;
+        }
+    );
 
     // Lists — nested unordered and ordered, respecting indentation depth.
     // applyOutsideCdata ensures list-like lines inside code blocks are not converted.

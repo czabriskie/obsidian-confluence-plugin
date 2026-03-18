@@ -114,7 +114,10 @@ Key transformations (in order):
 9. Inline code → `<code>`
 10. Bold, italic, strikethrough
 11. Horizontal rules → `<hr/>`
-12. Blockquotes → `<blockquote>`
+12. Blockquotes → `<blockquote><p>...</p></blockquote>`
+    - Handles `>text` (no space) and `> text` (with space)
+    - Consecutive `>` lines merged into one block
+    - Content passed through `escapeXmlTextNodes()` to preserve inline HTML from prior passes
 13. **Lists** (`convertLists`) — nested `<ul>`/`<ol>` built recursively from indentation depth
     - Wrapped in `applyOutsideCdata()` so `- item` lines inside code blocks are not converted
     - Item text uses `escapeXmlTextNodes()` (not `escapeXmlText`) so inline HTML tags already present from bold/code passes are preserved
