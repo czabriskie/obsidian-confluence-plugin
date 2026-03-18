@@ -113,6 +113,9 @@ Key transformations (in order):
    - Wrapped in `applyOutsideCdata()` so pipe chars inside code blocks are safe
 9. Inline code → `<code>`
 10. Bold, italic, strikethrough
+    - `**text**` / `__text__` → `<strong>`
+    - `*text*` → `<em>`
+    - `_text_` → `<em>` — uses `(?<!\w)_(.+?)_(?!\w)` to avoid matching underscores inside identifiers/URLs (e.g. `merge_requests`)
 11. Horizontal rules → `<hr/>`
 12. Blockquotes → `<blockquote><p>...</p></blockquote>`
     - Handles `>text` (no space) and `> text` (with space)
@@ -121,7 +124,7 @@ Key transformations (in order):
 13. **Lists** (`convertLists`) — nested `<ul>`/`<ol>` built recursively from indentation depth
     - Wrapped in `applyOutsideCdata()` so `- item` lines inside code blocks are not converted
     - Item text uses `escapeXmlTextNodes()` (not `escapeXmlText`) so inline HTML tags already present from bold/code passes are preserved
-14. Links → `<a href="...">`
+14. Links → `<a href="...">` — regex `([^)\s]+)(?:\s+"[^"]*")?` strips optional title attribute (`[text](url "title")` → `<a href="url">text</a>`)
 15. Paragraphs — wraps remaining lines in `<p>`:
     - Skips lines inside `<![CDATA[...]]>` blocks
     - Lines with inline HTML use `escapeXmlTextNodes()` to escape only text nodes, preserving `<strong>`, `<code>`, `<a>` etc.

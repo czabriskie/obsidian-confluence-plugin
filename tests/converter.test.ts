@@ -76,6 +76,19 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain('<a href="https://example.com">click here</a>');
     });
 
+    it("converts links with title attribute", () => {
+        const md = '[MR](https://gitlab.com/org/repo/-/merge_requests/405 "https://gitlab.com/org/repo/-/merge_requests/405")';
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<a href="https://gitlab.com/org/repo/-/merge_requests/405">MR</a>');
+        expect(result).not.toContain('href="https://gitlab.com/org/repo/-/merge_requests/405 ');
+    });
+
+    it("converts multiple inline links with complex URLs", () => {
+        const md = 'Could someone take a look at the [MR](https://gitlab.com/zontal/infrastructure/gitlab-ci-resources/-/merge_requests/405 "https://gitlab.com/zontal/infrastructure/gitlab-ci-resources/-/merge_requests/405") for that?';
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<a href="https://gitlab.com/zontal/infrastructure/gitlab-ci-resources/-/merge_requests/405">MR</a>');
+    });
+
     it("converts images", () => {
         const md = "![alt](https://example.com/img.png)";
         const result = markdownToConfluenceStorage(md);

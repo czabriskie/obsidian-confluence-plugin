@@ -277,8 +277,10 @@ export function markdownToConfluenceStorage(markdown: string): string {
     html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
 
     // Italic
+    // Note: _word_ italics require a non-word-char boundary so that underscores
+    // inside identifiers (merge_requests, snake_case) are not treated as italic markers.
     html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-    html = html.replace(/_(.+?)_/g, "<em>$1</em>");
+    html = html.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
 
     // Strikethrough
     html = html.replace(/~~(.+?)~~/g, "<del>$1</del>");
@@ -311,9 +313,9 @@ export function markdownToConfluenceStorage(markdown: string): string {
         '<ac:image><ri:url ri:value="$2"/></ac:image>'
     );
 
-    // Links  [text](url)
+    // Links  [text](url) or [text](url "title") — strip optional title
     html = html.replace(
-        /\[([^\]]+)\]\(([^)]+)\)/g,
+        /\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
         '<a href="$2">$1</a>'
     );
 
