@@ -157,6 +157,37 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).not.toContain("My Page");
     });
 
+    it("resolves wiki link to Confluence URL when page is in the map", () => {
+        const map = new Map([["my page", "https://wiki.example.com/pages/viewpage.action?pageId=123"]]);
+        const result = markdownToConfluenceStorage("See [[My Page]] for details", map);
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=123">My Page</a>');
+    });
+
+    it("resolves wiki link alias to Confluence URL", () => {
+        const map = new Map([["my page", "https://wiki.example.com/pages/viewpage.action?pageId=123"]]);
+        const result = markdownToConfluenceStorage("See [[My Page|the page]] for details", map);
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=123">the page</a>');
+    });
+
+    it("falls back to plain text for wiki links not in the map", () => {
+        const map = new Map([["other page", "https://wiki.example.com/pages/viewpage.action?pageId=999"]]);
+        const result = markdownToConfluenceStorage("See [[Unknown Page]] for details", map);
+        expect(result).not.toContain("<a href");
+        expect(result).toContain("Unknown Page");
+    });
+
+    it("resolves wiki link with file extension to Confluence URL", () => {
+        const map = new Map([["my page", "https://wiki.example.com/pages/viewpage.action?pageId=123"]]);
+        const result = markdownToConfluenceStorage("See [[My Page.md]] for details", map);
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=123">My Page</a>');
+    });
+
+    it("resolves path-prefixed wiki link using last segment", () => {
+        const map = new Map([["my page", "https://wiki.example.com/pages/viewpage.action?pageId=123"]]);
+        const result = markdownToConfluenceStorage("See [[Folder/My Page]] for details", map);
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=123">My Page</a>');
+    });
+
     it("converts Obsidian image embeds to ac:image macro", () => {
         const md = "Check ![[embedded-file.png]] here";
         const result = markdownToConfluenceStorage(md);
@@ -174,6 +205,26 @@ describe("markdownToConfluenceStorage", () => {
         const md = "Some text[^1] more\n\n[^1]: footnote def";
         const result = markdownToConfluenceStorage(md);
         expect(result).not.toContain("[^1]");
+    });
+
+    it("strips Waypoint markers and preserves wiki links inside as Confluence links", () => {
+        const map = new Map([
+            ["s3 bucket cleanup", "https://wiki.example.com/pages/viewpage.action?pageId=1"],
+            ["source control management", "https://wiki.example.com/pages/viewpage.action?pageId=2"],
+        ]);
+        const md = [
+            "%% Begin Waypoint %%",
+            "- [[S3 Bucket Cleanup]]",
+            "- [[Source Control Management]]",
+            "- [[Unknown Page]]",
+            "%% End Waypoint %%",
+        ].join("\n");
+        const result = markdownToConfluenceStorage(md, map);
+        expect(result).not.toContain("%% Begin Waypoint %%");
+        expect(result).not.toContain("%% End Waypoint %%");
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=1">S3 Bucket Cleanup</a>');
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=2">Source Control Management</a>');
+        expect(result).toContain("Unknown Page");
     });
 
     it("normalizes tabs to spaces", () => {

@@ -201,13 +201,22 @@ function convertLists(input: string): string {
     );
 }
 
-export function markdownToConfluenceStorage(markdown: string): string {
+export function markdownToConfluenceStorage(
+    markdown: string,
+    titleToUrl: Map<string, string> = new Map(),
+    contextDir?: string
+): string {
     let html = markdown;
 
     // Front-matter: strip YAML front-matter block (---...---) at the top
     html = html.replace(/^---[\s\S]*?---\n?/, "");
 
     // ── Obsidian-specific syntax ──────────────────────────────────────────
+    // Obsidian comment markers (%% ... %%) — strip the markers but keep content
+    // between them (e.g. Waypoint plugin TOC). The markers are invisible in
+    // Obsidian preview and have no meaning in Confluence.
+    html = html.replace(/^%%[^\n]*%%\s*$/gm, "");
+
     // Callouts: > [!NOTE] Title → bold label in blockquote
     html = html.replace(/^> \[!(\w+)\]\s*(.*)/gm, (_, type, title) =>
         `> **${type}${title ? ": " + title : ""}**`
@@ -218,12 +227,52 @@ export function markdownToConfluenceStorage(markdown: string): string {
     );
     // Other embedded files (non-image): remove entirely
     html = html.replace(/!\[\[[^\]]*\]\]/g, "");
-    // Wiki links with file extensions: [[File.ext|Alias]] or [[File.ext]] → just alias/filename without ext
-    html = html.replace(/\[\[([^\]|]+\.[a-zA-Z0-9]+)\s*\|([^\]]+)\]\]/g, "$2");
-    html = html.replace(/\[\[([^\]|]+\.[a-zA-Z0-9]+)\]\]/g, (_, f) => f.replace(/\.[^.]+$/, ""));
-    // Regular wiki links: [[Page|Alias]] → Alias, [[Page]] → Page
-    html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2");
-    html = html.replace(/\[\[([^\]]+)\]\]/g, "$1");
+
+    // Wiki links — resolve to Confluence URL if the page is in the sync map,
+    // otherwise fall back to plain text (alias or page name).
+    // Context-aware: if contextDir is provided (the directory of the source file
+    // relative to the sync root), try "contextDir/title" first. This lets
+    // [[Learning]] inside Site Reliability Engineering/ resolve to
+    // "site reliability engineering/learning" rather than the global "learning".
+    const resolveWikiUrl = (lookup: string): string | undefined => {
+        const key = lookup.trim().toLowerCase();
+        if (contextDir) {
+            const ctxKey = `${contextDir.toLowerCase()}/${key}`;
+            const ctxUrl = titleToUrl.get(ctxKey);
+            if (ctxUrl) return ctxUrl;
+        }
+        return titleToUrl.get(key);
+    };
+
+    // [[File.ext|Alias]] / [[File.ext]] — strip extension, then resolve
+    html = html.replace(/\[\[([^\]|]+\.[a-zA-Z0-9]+)\s*\|([^\]]+)\]\]/g, (_, _file, alias) => {
+        const title = _file.replace(/\.[^.]+$/, "");
+        const url = resolveWikiUrl(title);
+        return url ? `<a href="${url}">${escapeXmlText(alias)}</a>` : escapeXmlText(alias);
+    });
+    html = html.replace(/\[\[([^\]|]+\.[a-zA-Z0-9]+)\]\]/g, (_, f) => {
+        const title = f.replace(/\.[^.]+$/, "");
+        const url = resolveWikiUrl(title);
+        return url ? `<a href="${url}">${escapeXmlText(title)}</a>` : escapeXmlText(title);
+    });
+    // [[Page|Alias]] / [[Page]] — resolve by page name
+    html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, page, alias) => {
+        // Support path-prefixed links like [[Folder/Page|Alias]] — try full path first, then last segment
+        const segments = page.split("/");
+        const lastName = segments[segments.length - 1];
+        const url = resolveWikiUrl(page)
+            ?? resolveWikiUrl(lastName);
+        return url ? `<a href="${url}">${escapeXmlText(alias)}</a>` : escapeXmlText(alias);
+    });
+    html = html.replace(/\[\[([^\]]+)\]\]/g, (_, page) => {
+        const segments = page.split("/");
+        const lastName = segments[segments.length - 1];
+        const url = resolveWikiUrl(page)
+            ?? resolveWikiUrl(lastName);
+        // Use only the last path segment as the display text (matches Obsidian behaviour)
+        const display = lastName;
+        return url ? `<a href="${url}">${escapeXmlText(display)}</a>` : escapeXmlText(display);
+    });
     // Highlights: ==text== → bold
     html = html.replace(/==(.+?)==/g, "**$1**");
     // Footnote references: [^1] → remove markers

@@ -315,9 +315,22 @@ export class ConfluenceClient {
         await this.request<void>(`/content/${pageId}`, { method: "DELETE" });
     }
 
+    /** Returns the attachment ID for a given filename on a page, or null if not found. */
+    async getAttachmentId(pageId: string, filename: string): Promise<string | null> {
+        try {
+            const data = await this.request<{ results: Array<{ id: string; title: string }> }>(
+                `/rest/api/content/${pageId}/child/attachment?filename=${encodeURIComponent(filename)}&limit=1`
+            );
+            return data.results?.[0]?.id ?? null;
+        } catch {
+            return null;
+        }
+    }
+
     /**
      * Upload a file as an attachment on a Confluence page.
-     * If an attachment with the same filename already exists it is replaced.
+     * If an attachment with the same filename already exists it is replaced
+     * via PUT to the existing attachment's data endpoint.
      * Returns the attachment ID.
      */
     async uploadAttachment(pageId: string, filename: string, data: ArrayBuffer, mimeType: string): Promise<string> {
@@ -327,9 +340,15 @@ export class ConfluenceClient {
         const https = require("https") as typeof import("https");
         const { URL } = require("url") as typeof import("url");
 
-        const endpoint = new URL(
-            `${this.baseUrl}/rest/api/content/${pageId}/child/attachment`
-        );
+        // Check if the attachment already exists so we can PUT (update) instead
+        // of POST (create), avoiding 409 "already exists" errors.
+        const existingId = await this.getAttachmentId(pageId, filename);
+        const path = existingId
+            ? `${this.baseUrl}/rest/api/content/${pageId}/child/attachment/${existingId}/data`
+            : `${this.baseUrl}/rest/api/content/${pageId}/child/attachment`;
+        const method = existingId ? "PUT" : "POST";
+
+        const endpoint = new URL(path);
 
         const boundary = `ConfluenceBoundary${Date.now()}`;
         const CRLF = "\r\n";
@@ -354,7 +373,7 @@ export class ConfluenceClient {
                     hostname: endpoint.hostname,
                     port: 443,
                     path: endpoint.pathname + endpoint.search,
-                    method: "POST",
+                    method,
                     headers: {
                         Authorization: this.authHeader,
                         "X-Atlassian-Token": "no-check",

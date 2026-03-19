@@ -46,12 +46,45 @@ export class SyncEngine {
      */
     private _foundFolderCache = new Map<string, string>();
 
+    /**
+     * Basenames that appear in more than one directory under the sync root.
+     * When a basename is in this set, titleFromFile() prefixes it with the
+     * immediate parent directory so the Confluence page title is unique within
+     * the space. (Confluence enforces space-wide title uniqueness.)
+     * Local filenames are never affected — only the Confluence page title.
+     */
+    private _ambiguousBasenames = new Set<string>();
+
     constructor(
         private vault: Vault,
         private client: ConfluenceClient,
         private state: SyncStateManager,
         private settings: ConfluenceSyncSettings
     ) { }
+
+    /**
+     * Build a map of page title (lowercased) → Confluence page URL from the
+     * current sync state. Used to resolve [[wiki links]] in markdown.
+     */
+    /**
+     * Returns the immediate parent folder name of `file`, lowercased.
+     * Used as `contextDir` for wiki link resolution in markdownToConfluenceStorage.
+     * Disambiguated Confluence titles use the format "ParentDir/basename", so
+     * matching against just the parent folder name is sufficient.
+     */
+    private contextDirForFile(file: TFile): string {
+        return (file.parent?.name ?? "").toLowerCase();
+    }
+
+    private buildTitleToUrl(): Map<string, string> {
+        const base = this.settings.confluenceBaseUrl.replace(/\/$/, "");
+        const map = new Map<string, string>();
+        for (const record of Object.values(this.state.all())) {
+            const url = `${base}/pages/viewpage.action?pageId=${record.confluencePageId}`;
+            map.set(record.confluenceTitle.trim().toLowerCase(), url);
+        }
+        return map;
+    }
 
     async sync(): Promise<SyncResult> {
         const result: SyncResult = {
@@ -70,14 +103,34 @@ export class SyncEngine {
         // ── 1. Collect local files ────────────────────────────────────────
         const localFiles = await this.collectLocalFiles();
         console.log(`[ConfluenceSync] Found ${localFiles.length} local markdown file(s):`, localFiles.map(f => f.path));
+        this._ambiguousBasenames = this.computeAmbiguousBasenames(localFiles);
+
+        // Pre-pass: rename any Confluence pages whose stored title no longer
+        // matches the title we'd compute for them now (e.g. separator changed,
+        // or disambiguation was just introduced). Doing this before any creates
+        // ensures the title space is clean regardless of processing order.
+        await this.preRenameStalePages(localFiles);
 
         // ── 2. Push local → remote ────────────────────────────────────────
         // Push first so that folder pages exist in Confluence (and in folderMap)
         // before we fetch remote pages for pull.  This also means newly-pushed
         // pages will have sync records when pull runs, preventing them being
         // pulled back down as "new" files.
+        //
+        // Waypoint files (same basename as parent dir) are pushed LAST so that
+        // all the pages they link to already have Confluence records in state,
+        // making wiki link → URL resolution complete and correct.
         if (direction === "both" || direction === "push") {
-            for (const file of localFiles) {
+            const isWaypoint = (f: TFile) => {
+                const parts = f.path.split("/");
+                const parentDir = parts.length >= 2 ? parts[parts.length - 2] : "";
+                return parentDir === f.basename;
+            };
+            const nonWaypoints = localFiles.filter(f => !isWaypoint(f));
+            const waypoints    = localFiles.filter(f =>  isWaypoint(f));
+            const orderedFiles = [...nonWaypoints, ...waypoints];
+
+            for (const file of orderedFiles) {
                 if (this.isExcluded(file.path)) {
                     console.log(`[ConfluenceSync] ⏭ Excluded: ${file.path}`);
                     continue;
@@ -157,13 +210,14 @@ export class SyncEngine {
         const content = await this.vault.read(file);
         const record = this.state.get(file.path);
 
-        // Check if this file was moved from another path — match by title
-        // against existing sync records. If found, treat as a move (reparent)
-        // rather than a brand-new file.
+        // Check if this file was moved from another path — match by title against
+        // existing sync records where the original file no longer exists.
+        // Guard: if another file at oldPath still exists, this is a duplicate name
+        // (not a move) — skip move logic entirely.
         if (!record) {
             const title = this.titleFromFile(file);
             const movedFrom = this.findRecordByTitle(title);
-            if (movedFrom) {
+            if (movedFrom && !this.vault.getAbstractFileByPath(movedFrom.path)) {
                 const { path: oldPath, record: oldRecord } = movedFrom;
                 console.log(`[ConfluenceSync] Detected move: "${oldPath}" → "${file.path}"`);
 
@@ -183,7 +237,7 @@ export class SyncEngine {
                     throw e;
                 }
 
-                const storageBody = markdownToConfluenceStorage(content);
+                const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
                 const parentToUse = newParentId ?? remotePage.parentId;
                 console.log(`[ConfluenceSync] Re-parenting "${title}" from parent ${oldRecord.confluenceParentId} → ${parentToUse}`);
 
@@ -213,7 +267,8 @@ export class SyncEngine {
         if (!record) {
             // Brand new local file – create on Confluence under the correct parent
             const expectedParentId = await this.resolveParentId(file);
-            const storageBody = markdownToConfluenceStorage(content);
+            const titleToUrl = this.buildTitleToUrl();
+            const storageBody = markdownToConfluenceStorage(content, titleToUrl, this.contextDirForFile(file));
             const title = this.titleFromFile(file);
 
             // Guard: if the resolved parent IS a page with the same title as this
@@ -255,11 +310,56 @@ export class SyncEngine {
                     return this.pushFile(file, result);
                 }
                 // Title collision – a page with this name already exists in the space.
-                // Find it and link it to this local file instead of failing.
+                // Only link to it if no other local file already owns that page ID.
                 if (String(e).includes("already exists")) {
                     const existing = await this.client.getPageByTitle(title, expectedParentId)
                         ?? await this.client.getPageByTitle(title);
                     if (existing) {
+                        const alreadyOwned = this.state.findByPageId(existing.id);
+                        if (alreadyOwned && alreadyOwned !== file.path) {
+                            // Another local file owns this page. Check whether
+                            // disambiguation has now assigned that file a new
+                            // prefixed title (e.g. a Waypoint file is claiming
+                            // the plain basename, displacing the previous owner).
+                            // If so, rename the displaced page first, then retry.
+                            const otherFile = this.vault.getAbstractFileByPath(alreadyOwned);
+                            console.log(
+                                `[ConfluenceSync] Displacement check: alreadyOwned="${alreadyOwned}" ` +
+                                `otherFile=${otherFile ? "found (" + otherFile.constructor.name + ")" : "NOT FOUND"} ` +
+                                `existing.title="${existing.title}"`
+                            );
+                            if (otherFile instanceof TFile) {
+                                const otherNewTitle = this.titleFromFile(otherFile);
+                                console.log(`[ConfluenceSync] Displacement otherNewTitle="${otherNewTitle}" vs existing.title="${existing.title}"`);
+                                if (otherNewTitle !== existing.title) {
+                                    console.log(
+                                        `[ConfluenceSync] Renaming displaced page "${existing.title}" → "${otherNewTitle}" ` +
+                                        `(owned by "${alreadyOwned}") to free up title for "${file.path}"`
+                                    );
+                                    const updated = await this.client.updatePage(
+                                        existing.id,
+                                        otherNewTitle,
+                                        existing.body,
+                                        existing.version,
+                                        existing.parentId
+                                    );
+                                    const otherRecord = this.state.get(alreadyOwned)!;
+                                    this.state.set(alreadyOwned, {
+                                        ...otherRecord,
+                                        confluenceTitle: updated.title,
+                                        confluenceVersion: updated.version,
+                                    });
+                                    // Title is now free — retry creating this file's page.
+                                    return this.pushFile(file, result);
+                                }
+                            }
+                            // Another local file owns this page — don't steal it.
+                            // Re-throw so the caller surfaces the error.
+                            throw new Error(
+                                `Confluence page "${title}" (${existing.id}) is already linked to "${alreadyOwned}". ` +
+                                `Rename one of the files to give it a unique title.`
+                            );
+                        }
                         console.log(`[ConfluenceSync] Linking "${title}" to existing page ${existing.id}`);
                         this.state.set(file.path, {
                             confluencePageId: existing.id,
@@ -286,7 +386,7 @@ export class SyncEngine {
             return true;
         }
         // against the stored hash (which is always a storage-body hash).
-        const storageBodyForCheck = markdownToConfluenceStorage(content);
+        const storageBodyForCheck = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
         const storageHash = SyncStateManager.hash(storageBodyForCheck);
         const localChanged = storageHash !== record.contentHash;
 
@@ -310,7 +410,15 @@ export class SyncEngine {
             && expectedParentId !== undefined
             && expectedParentId !== record.confluenceParentId;
 
-        if (!localChanged && !needsReparent && !force) {
+        // Check if the disambiguation title has changed (e.g. separator changed,
+        // or the file was previously synced before disambiguation was introduced).
+        const currentTitle = this.titleFromFile(file);
+        const needsTitleRename = currentTitle !== record.confluenceTitle;
+        if (needsTitleRename) {
+            console.log(`[ConfluenceSync] Title rename needed for "${file.path}": "${record.confluenceTitle}" → "${currentTitle}"`);
+        }
+
+        if (!localChanged && !needsReparent && !needsTitleRename && !force) {
             // Lazily backfill confluenceParentId if it was missing
             if (record.confluenceParentId === undefined) {
                 try {
@@ -358,7 +466,7 @@ export class SyncEngine {
             console.log(`[ConfluenceSync] Re-parenting "${remotePage.title}" to parent ${expectedParentId}`);
         }
 
-        const storageBody = markdownToConfluenceStorage(content);
+        const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
         const title = this.titleFromFile(file);
         let page;
         try {
@@ -404,6 +512,7 @@ export class SyncEngine {
      */
     async pushFileDirect(file: TFile, force = false): Promise<SyncResult> {
         this._foundFolderCache.clear();
+        this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
         const result: SyncResult = { pushed: [], pulled: [], conflicts: [], errors: [] };
         try {
             if (force) {
@@ -411,7 +520,7 @@ export class SyncEngine {
                 console.log(`[ConfluenceSync] Force push: file="${file.path}", hasRecord=${!!existing}, pageId=${existing?.confluencePageId}`);
                 if (existing) {
                     const content = await this.vault.read(file);
-                    const storageBody = markdownToConfluenceStorage(content);
+                    const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
                     console.log(`[ConfluenceSync] Force push: fetching remote page ${existing.confluencePageId}`);
                     let remotePage;
                     try {
@@ -472,9 +581,10 @@ export class SyncEngine {
         ancestorTitles: string[] = []
     ): Promise<boolean> {
         // Skip folder/container pages — they represent directories, not content files.
+        // Exception: if a sync record also points to this page ID, the folder page
+        // doubles as a Waypoint content page (same-name folder); don't skip it.
         const allFolderPageIds = new Set(Object.values(this.state.allFolders()));
-        if (allFolderPageIds.has(page.id)) {
-            console.log(`[ConfluenceSync] ⏭ Skipping folder page in pull: "${page.title}" (${page.id})`);
+        if (allFolderPageIds.has(page.id) && !this.state.findByPageId(page.id)) {
             return false;
         }
 
@@ -527,39 +637,12 @@ export class SyncEngine {
             return true;
         }
 
-        // Brand new remote page – only create a local file if this page sits
-        // directly under the configured sync root or under a folder page we
-        // manage. Pre-existing deep pages in Confluence that were never part of
-        // this sync should not be auto-imported.
-        const rootParentId = this.settings.confluenceParentPageId;
-        const directParent = page.parentId;
-        const isDirectChild = directParent === rootParentId
-            || (directParent !== undefined && allFolderPageIds.has(directParent));
-
-        if (!isDirectChild) {
-            console.log(`[ConfluenceSync] ⏭ Skipping unmanaged remote page: "${page.title}" (parent ${directParent})`);
-            return false;
-        }
-
-        // Create the local file
-        const markdown = confluenceStorageToMarkdown(page.body);
-        const targetPath = this.buildLocalPathFromAncestors(page.title, ancestorIds, ancestorTitles);
-        await this.ensureFolder(targetPath);
-        const existing = this.vault.getAbstractFileByPath(targetPath);
-        if (existing instanceof TFile) {
-            await this.vault.modify(existing, markdown);
-        } else {
-            await this.vault.create(targetPath, markdown);
-        }
-        this.state.set(targetPath, {
-            confluencePageId: page.id,
-            confluenceTitle: page.title,
-            confluenceVersion: page.version,
-            confluenceParentId: page.parentId,
-            lastSyncedAt: new Date().toISOString(),
-            contentHash: remoteHash,
-        });
-        return true;
+        // Remote page has no local counterpart — skip. Local vault is the
+        // master for file structure: new pages created in Confluence are not
+        // auto-imported. Only content updates to already-tracked files are
+        // pulled (handled above).
+        console.log(`[ConfluenceSync] ⏭ No local file for remote page "${page.title}" (${page.id}) — skipping (local is structure master)`);
+        return false;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -666,7 +749,6 @@ export class SyncEngine {
         for (const c of children) {
             // Skip folder/container pages (pages we created or found for subdirectories)
             if (folderPageIds.has(c.id)) {
-                console.log(`[ConfluenceSync] Skipping folder page: "${c.title}"`);
                 continue;
             }
 
@@ -691,8 +773,72 @@ export class SyncEngine {
         return pages;
     }
 
+    /**
+     * Before the main sync loop, rename any Confluence pages whose stored title
+     * no longer matches what titleFromFile() now computes. This ensures the title
+     * space is clean before any creates run, regardless of processing order.
+     */
+    private async preRenameStalePages(files: TFile[]): Promise<void> {
+        for (const file of files) {
+            const record = this.state.get(file.path);
+            if (!record) continue;
+            const currentTitle = this.titleFromFile(file);
+            if (currentTitle === record.confluenceTitle) continue;
+            console.warn(
+                `[ConfluenceSync] Pre-rename: "${file.path}" ` +
+                `"${record.confluenceTitle}" → "${currentTitle}"`
+            );
+            try {
+                const remotePage = await this.client.getPage(record.confluencePageId);
+                const updated = await this.client.updatePage(
+                    record.confluencePageId,
+                    currentTitle,
+                    remotePage.body,
+                    remotePage.version,
+                    remotePage.parentId
+                );
+                this.state.set(file.path, {
+                    ...record,
+                    confluenceTitle: updated.title,
+                    confluenceVersion: updated.version,
+                });
+                console.warn(`[ConfluenceSync] Pre-rename done: "${currentTitle}"`);
+            } catch (e) {
+                console.error(`[ConfluenceSync] Pre-rename failed for "${file.path}":`, e);
+            }
+        }
+    }
+
     private titleFromFile(file: TFile): string {
+        if (this._ambiguousBasenames.has(file.basename)) {
+            // Multiple files share this basename across different directories.
+            // Waypoint files have the same name as their containing directory
+            // (e.g. Learning/Learning.md — the folder's index page). They take
+            // precedence and keep the plain basename as their Confluence title.
+            // All other files sharing the basename are prefixed with their
+            // parent directory, e.g. "Learning and Sharing - Learning".
+            // Only the Confluence title is affected; local filenames are never changed.
+            const parts = file.path.split("/");
+            const parentDir = parts.length >= 2 ? parts[parts.length - 2] : "";
+            const isWaypoint = parentDir === file.basename;
+            const title = (parentDir && !isWaypoint) ? `${parentDir}/${file.basename}` : file.basename;
+            console.log(`[ConfluenceSync] titleFromFile: "${file.path}" → "${title}" (ambiguous; parentDir="${parentDir}" isWaypoint=${isWaypoint})`);
+            return title;
+        }
         return file.basename;
+    }
+
+    /** Returns the set of basenames that appear in more than one directory. */
+    private computeAmbiguousBasenames(files: TFile[]): Set<string> {
+        const counts = new Map<string, number>();
+        for (const f of files) {
+            counts.set(f.basename, (counts.get(f.basename) ?? 0) + 1);
+        }
+        const ambiguous = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([k]) => k));
+        if (ambiguous.size > 0) {
+            console.log(`[ConfluenceSync] Ambiguous basenames (will be prefixed):`, [...ambiguous]);
+        }
+        return ambiguous;
     }
 
     /**

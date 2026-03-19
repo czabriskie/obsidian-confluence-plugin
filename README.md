@@ -1,6 +1,6 @@
 # Obsidian Confluence Sync Plugin
 
-Two-way sync between a directory in your Obsidian vault and a Confluence space.
+Sync between a directory in your Obsidian vault and a Confluence space. The **local vault is the master** for file structure — creates, deletes, and moves always flow local → Confluence. Content updates to existing tracked pages flow both ways.
 
 ## Features
 
@@ -44,11 +44,13 @@ Open **Settings → Confluence Sync** and fill in:
 | **Space Key**           | The short key for your Confluence space, e.g. `ENG`           |
 | **Parent Page ID**      | (Optional) All synced pages are nested under this page        |
 | **Vault Directory**     | Vault-relative folder to sync, e.g. `Confluence`              |
-| **Sync Direction**      | Both ways / Push only / Pull only                             |
+| **Sync Direction**      | Both / Push only / Pull only (see note below)                 |
 | **Conflict Strategy**   | Keep newer / Keep local / Keep remote                         |
 | **Auto-Sync Interval**  | Minutes between automatic syncs (0 = disabled)                |
 
 Click **Test Connection** to verify your credentials.
+
+> **Sync direction note:** "Both" does not mean fully bidirectional. The local vault is always the master for file structure. "Both" means: push all local changes to Confluence, then pull content updates for already-tracked pages back. New pages created in Confluence are never automatically imported as local files.
 
 ### Excluding files or folders
 
@@ -56,32 +58,49 @@ Right-click any file or folder inside your sync directory in the file explorer a
 
 ## Commands
 
-| Command                                              | Description                                                                    |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| **Confluence Sync: Sync all**                        | Full two-way sync (push then pull, respecting sync direction setting)          |
-| **Confluence Sync: Push to Confluence**              | Push all local changes to Confluence                                           |
-| **Confluence Sync: Pull from Confluence**            | Pull all remote changes into the vault                                         |
-| **Confluence Sync: Push current file to Confluence** | Push only the active editor's file                                             |
-| **Confluence Sync: Reset sync state**                | Clear all file↔page mappings and folder mappings (does not delete remote data) |
-| **Confluence Sync: Delete unmanaged local files**    | Remove local files in the sync directory that are not tracked by the plugin    |
+| Command                                                       | Description                                                                    |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| **Confluence Sync: Sync all**                                 | Push local changes then pull content updates for tracked pages                 |
+| **Confluence Sync: Push to Confluence**                       | Push all local changes to Confluence                                           |
+| **Confluence Sync: Pull from Confluence**                     | Pull content updates for already-tracked pages from Confluence                 |
+| **Confluence Sync: Push current file to Confluence**          | Push only the active editor's file                                             |
+| **Confluence Sync: Force push current file to Confluence**    | Push the active file ignoring hash cache (useful after converter changes)      |
+| **Confluence Sync: Reset sync state**                         | Clear all file↔page mappings and folder mappings (does not delete remote data) |
+| **Confluence Sync: Delete unmanaged local files**             | Remove local files in the sync directory that are not tracked by the plugin    |
 
 You can also click the **C** ribbon icon for a quick full sync.
 
 ## How It Works
 
+### Sync model
+
+The **local vault is the master for file structure**. Creates, deletes, and moves only flow local → Confluence. Content updates to pages that are already tracked flow both ways (subject to the conflict strategy).
+
 ### Push
 
-1. Each `.md` file in the vault directory is hashed and compared against the last-synced hash.
-2. If changed, the Markdown is converted to Confluence Storage Format and upserted via the REST API.
-3. Sub-directories are created as "folder pages" (empty Confluence pages that act as parents).
+1. Each `.md` file in the vault directory is converted to Confluence Storage Format and its hash compared against the last-synced hash.
+2. If changed (or the Confluence title needs updating), the page is created or updated via the REST API.
+3. Sub-directories are created as “folder pages” (empty Confluence pages that act as parents).
 4. If a file has moved to a different directory since the last sync, the Confluence page is re-parented to match.
+5. **Waypoint files** (where the filename matches the parent folder) are pushed last so all their `[[wiki links]]` can be resolved to live Confluence URLs.
+6. `[[wiki links]]` are resolved context-aware: `[[Page]]` inside `Daily Notes/` prefers `"Daily Notes/Page"` before falling back to the global `"Page"` title.
+
+### Duplicate title disambiguation
+
+Confluence enforces space-wide unique page titles. When two vault files share the same basename (e.g. `Daily Notes/Learning.md` and `SRE/Learning.md`), the plugin automatically prefixes the Confluence title with the immediate parent folder using `/` as separator:
+
+- `Daily Notes/Learning.md` → Confluence title: `"Daily Notes/Learning"`
+- `SRE/Learning.md` → Confluence title: `"SRE/Learning"`
+- `Learning/Learning.md` (Waypoint — parent dir = filename) → keeps plain `"Learning"`
+
+Local filenames are never changed.
 
 ### Pull
 
-1. Child pages of the configured parent (and its managed sub-pages) are fetched from the Confluence API.
-2. Only pages that are direct children of a known parent are considered — the plugin never pulls from outside its managed tree.
-3. Each page's content hash is compared against the stored hash; changed pages are converted to Markdown and written to the vault.
-4. Folder pages (pages whose sole purpose is to act as directory parents) are **not** pulled as files.
+1. Child pages of the configured parent are fetched from the Confluence API.
+2. Only pages that already have a local file tracked in the sync state are considered.
+3. Each page’s content hash is compared against the stored hash; changed pages are converted to Markdown and written to the vault.
+4. Folder pages and untracked Confluence pages are skipped — no new local files are created.
 
 ### Conflict Resolution
 
@@ -97,12 +116,14 @@ The converter (`src/converter.ts`) handles:
 
 - Headings, bold, italic, strikethrough, inline code
 - Fenced code blocks ↔ Confluence `code` macro
-- Ordered and unordered lists
-- Links and images
+- Ordered and unordered lists (nested)
+- Tables (GFM ↔ Confluence `<table>`)
+- Links and images (including `![[image.png]]` → attachment macro)
 - Horizontal rules and blockquotes
-- Obsidian-specific syntax stripping: wiki links (`[[…]]`), embeds (`![[…]]`), highlights (`==…==`), footnotes, callouts, tags
+- Obsidian-specific syntax: `[[wiki links]]` (resolved to Confluence URLs), embeds (`![[...]]`), highlights (`==...==`), footnotes, callouts (`> [!NOTE]`), tags, Waypoint markers (`%% ... %%`)
 - YAML frontmatter removal
 - XML special-character escaping
+- Optional `titleToUrl` map and `contextDir` for context-aware wiki link → URL resolution
 
 ## Development
 
@@ -143,3 +164,8 @@ tests/
 - The Markdown ↔ Storage Format conversion handles the most common constructs. For complex tables or Confluence-specific macros, extend `src/converter.ts`.
 - API tokens are stored in Obsidian's plugin data file. Keep your vault private if it contains sensitive credentials.
 - Sync state is stored in `data.json` under the keys `syncMap` (file records) and `folderMap` (folder page IDs).
+- To start fresh: delete the synced pages in Confluence, run **Reset sync state**, then **Sync all**.
+
+## Known Bugs
+
+- **Image attachment 409 on re-push** — Re-uploading an image that already exists as a page attachment may occasionally produce a 409 error. Sync continues and no content is lost; the previously-uploaded attachment remains intact.

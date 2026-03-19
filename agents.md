@@ -7,7 +7,11 @@
 
 ## Project Summary
 
-An Obsidian plugin that provides **two-way sync** between a vault directory and a Confluence Cloud space. Written in TypeScript, compiled with esbuild, uses the Confluence REST API v1.
+An Obsidian plugin that syncs between a vault directory and a Confluence Cloud space. Written in TypeScript, compiled with esbuild, uses the Confluence REST API v1.
+
+**Sync model — local vault is the master:**
+- **File structure (creates, deletes, moves)** — local → Confluence only. New pages created in Confluence are never auto-imported as local files.
+- **Content updates** — bidirectional. If a tracked page changes in Confluence, the local file is updated on the next sync.
 
 - **Repo**: `czabriskie/obsidian-confluence-plugin` (GitHub, branch: `main`)
 - **Obsidian plugin ID**: `obsidian-confluence-plugin`
@@ -20,7 +24,7 @@ An Obsidian plugin that provides **two-way sync** between a vault directory and 
 
 ```bash
 npm run build     # tsc type-check + esbuild bundle → main.js
-npm test          # vitest run (44 tests across tests/)
+npm test          # vitest run (66 tests across tests/)
 ```
 
 **Deploy to vault:**
@@ -96,14 +100,17 @@ The required header to bypass Atlassian's XSRF on attachments is `X-Atlassian-To
 
 ### `converter.ts` — Markdown ↔ Confluence Storage Format
 
-**`markdownToConfluenceStorage(markdown): string`**
+**`markdownToConfluenceStorage(markdown, titleToUrl?, contextDir?): string`**
 
 Key transformations (in order):
 1. Strip YAML front-matter (`---...---`)
-2. Obsidian callouts (`> [!NOTE]`) → bold label in blockquote
-3. `![[image.png]]` → `<ac:image><ri:attachment ri:filename="..."/></ac:image>`
-4. Other `![[...]]` embeds → deleted
-5. Wiki links (`[[Page|Alias]]`, `[[File.ext]]`) → plain text
+2. Strip `%% ... %%` Obsidian comment markers (Waypoint plugin uses these)
+3. Obsidian callouts (`> [!NOTE]`) → bold label in blockquote
+4. `![[image.png]]` → `<ac:image><ri:attachment ri:filename="..."/></ac:image>`
+5. Other `![[...]]` embeds → deleted
+6. Wiki links (`[[Page|Alias]]`, `[[File.ext]]`) — resolved to `<a href="...">` via `titleToUrl` map
+   - `contextDir` (the file's immediate parent folder, lowercased) is tried first as `"contextDir/title"` to prefer sibling-directory matches over global ones
+   - Falls back to plain text if not in map
 6. Headings
 7. Code fences → `<ac:structured-macro ac:name="code">` with CDATA
    - Regex: `/^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm` (captures full first line, uses first token as language)
@@ -150,15 +157,17 @@ Returns unique image filenames from `![[...]]` syntax. Used by `SyncEngine.uploa
 
 ---
 
-### `syncEngine.ts` — Core sync orchestration (~1040 lines)
+### `syncEngine.ts` — Core sync orchestration (~1100 lines)
 
 **`SyncEngine` class constructor:** `new SyncEngine(vault, client, state, settings)`
 
-**`sync(): Promise<SyncResult>`** — full two-way sync
+**`sync(): Promise<SyncResult>`** — sync (local is structure master)
 - Reads all `.md` files under `settings.vaultDirectory`
 - Skips excluded paths (`settings.excludedPaths`)
-- Push logic: compare `SyncStateManager.hash(content)` vs stored `contentHash`
-- Pull logic: compare `confluenceVersion` vs stored `confluenceVersion`
+- **Pre-pass**: renames any Confluence pages whose stored title no longer matches `titleFromFile()` (via `preRenameStalePages`)
+- **Push order**: non-Waypoint files first, then Waypoint files last — ensures all linked pages have Confluence records before Waypoints resolve wiki links
+- Push logic: compare `SyncStateManager.hash(storageBody)` vs stored `contentHash`; also triggers on title rename (`needsTitleRename`)
+- Pull logic: only updates **already-tracked** local files — never creates new local files from Confluence pages
 - Conflict resolution via `settings.conflictStrategy` (`"local"` / `"remote"` / `"newer"`)
 - Handles folder hierarchy: creates Confluence "folder pages" for vault subdirectories, caches in `SyncStateManager.setFolder()`
 
@@ -255,3 +264,17 @@ Run with `npm test` (vitest).
 7. **Confluence REST API v1** — the plugin uses v1 (`/rest/api/...`), not v2. The v2 API has different endpoint paths and response shapes.
 
 8. **Auth** — Basic auth with `email:apiToken` base64 encoded. The API token is created at https://id.atlassian.com/manage-profile/security/api-tokens. It is NOT the user's password.
+
+9. **Confluence enforces space-wide unique page titles** — not just per parent. When multiple local files share the same basename (e.g. `Daily Notes/Learning.md` and `SRE/Learning.md`), `titleFromFile()` disambiguates by prefixing the immediate parent directory using `/` as separator (e.g. `"Daily Notes/Learning"`). Waypoint files (where `file.basename === file.parent.name`) are exempt and keep the plain basename.
+
+10. **Waypoint files pushed last** — Files identified as Waypoints (index pages whose name matches their parent folder) are pushed after all other files in `sync()`. This ensures all their wiki link targets already have Confluence page IDs in state, so `buildTitleToUrl()` can resolve links to `<a href="...">` correctly.
+
+11. **`contextDir` for wiki link resolution** — `markdownToConfluenceStorage()` accepts an optional `contextDir` (the file's immediate parent folder name, lowercased). This is used to prefer sibling-directory disambiguation matches: `[[Learning]]` inside `Daily Notes/` resolves to `"daily notes/learning"` before falling back to the global `"learning"`. Use `file.parent?.name.toLowerCase()` — do NOT use the full sync-root-relative path.
+
+12. **Pull is content-only** — `pullPage()` only updates files that already exist in the local sync state. It never creates new local files from Confluence pages. The local vault is the authoritative source for file structure.
+
+## Known Bugs
+
+- **Image attachment 409 on re-push** — Uploading an image attachment that already exists on a page can still produce a 409 error in some cases. The `uploadAttachment()` method attempts to detect existing attachments via `getAttachmentId()` and use `PUT .../data` for updates, but this does not always prevent the conflict. Non-blocking: the console logs the error and sync continues.
+
+
