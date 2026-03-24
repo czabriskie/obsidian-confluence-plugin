@@ -107,6 +107,68 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("quoted text");
     });
 
+    it("converts Warning callout to Confluence warning macro", () => {
+        const md = "> [!Warning] This Didn't seem to Actually do Anything. Root Cause still unknown";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="warning">');
+        expect(result).toContain('<ac:parameter ac:name="title">This Didn\'t seem to Actually do Anything. Root Cause still unknown</ac:parameter>');
+        expect(result).not.toContain("<blockquote>");
+    });
+
+    it("converts Note callout to Confluence note macro", () => {
+        const md = "> [!Note] Important information";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="note">');
+        expect(result).toContain('<ac:parameter ac:name="title">Important information</ac:parameter>');
+    });
+
+    it("converts Info callout to Confluence info macro", () => {
+        const md = "> [!Info] For your information";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="info">');
+        expect(result).toContain('<ac:parameter ac:name="title">For your information</ac:parameter>');
+    });
+
+    it("converts Tip callout to Confluence tip macro", () => {
+        const md = "> [!Tip] Pro tip here";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="tip">');
+        expect(result).toContain('<ac:parameter ac:name="title">Pro tip here</ac:parameter>');
+    });
+
+    it("converts multi-line callout with body content", () => {
+        const md = "> [!Warning] Title\n> First line\n> Second line";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="warning">');
+        expect(result).toContain('<ac:parameter ac:name="title">Title</ac:parameter>');
+        expect(result).toContain('<ac:rich-text-body><p>First line Second line</p></ac:rich-text-body>');
+    });
+
+    it("converts callout without title", () => {
+        const md = "> [!Note]\n> Just the content without a title";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="note">');
+        expect(result).toContain('<ac:rich-text-body><p>Just the content without a title</p></ac:rich-text-body>');
+        expect(result).not.toContain('<ac:parameter ac:name="title">');
+    });
+
+    it("converts callout with inline formatting in body", () => {
+        const md = "> [!Info] Title\n> This has **bold** and *italic* and `code`";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<ac:structured-macro ac:name="info">');
+        expect(result).toContain('<strong>bold</strong>');
+        expect(result).toContain('<em>italic</em>');
+        expect(result).toContain('<code>code</code>');
+    });
+
+    it("maps various callout types to appropriate Confluence macros", () => {
+        expect(markdownToConfluenceStorage("> [!danger] text")).toContain('<ac:structured-macro ac:name="warning">');
+        expect(markdownToConfluenceStorage("> [!error] text")).toContain('<ac:structured-macro ac:name="warning">');
+        expect(markdownToConfluenceStorage("> [!bug] text")).toContain('<ac:structured-macro ac:name="warning">');
+        expect(markdownToConfluenceStorage("> [!success] text")).toContain('<ac:structured-macro ac:name="tip">');
+        expect(markdownToConfluenceStorage("> [!example] text")).toContain('<ac:structured-macro ac:name="info">');
+    });
+
     it("converts a simple table", () => {
         const md = "| Key | Value |\n|---|---|\n| foo | bar |";
         const result = markdownToConfluenceStorage(md);

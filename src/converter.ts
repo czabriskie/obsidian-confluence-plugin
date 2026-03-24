@@ -217,9 +217,63 @@ export function markdownToConfluenceStorage(
     // Obsidian preview and have no meaning in Confluence.
     html = html.replace(/^%%[^\n]*%%\s*$/gm, "");
 
-    // Callouts: > [!NOTE] Title → bold label in blockquote
-    html = html.replace(/^> \[!(\w+)\]\s*(.*)/gm, (_, type, title) =>
-        `> **${type}${title ? ": " + title : ""}**`
+    // Callouts: > [!NOTE] Title → Confluence info/warning/note macro
+    // Handle multi-line callouts by matching entire blocks
+    html = html.replace(
+        /^> \[!(\w+)\](?: ([^\n]*))?$\n?((?:^> [^\n]*$\n?)*)/gm,
+        (match, type, title, bodyLines) => {
+            // Map Obsidian callout types to Confluence macro names
+            const typeMap: Record<string, string> = {
+                "note": "note",
+                "info": "info",
+                "tip": "tip",
+                "success": "tip",
+                "warning": "warning",
+                "caution": "warning",
+                "danger": "warning",
+                "error": "warning",
+                "bug": "warning",
+                "example": "info",
+                "quote": "info",
+                "abstract": "info",
+                "summary": "info",
+                "todo": "info",
+                "question": "info",
+                "faq": "info"
+            };
+            
+            const macroName = typeMap[type.toLowerCase()] || "info";
+            
+            // Extract and clean body content
+            let body = "";
+            if (bodyLines) {
+                body = bodyLines
+                    .split("\n")
+                    .map((line: string) => line.replace(/^> ?/, "").trim())
+                    .filter((line: string) => line.length > 0)
+                    .join(" ");
+            }
+            
+            // Build the macro
+            let macro = `<ac:structured-macro ac:name="${macroName}">`;
+            
+            if (title && title.trim()) {
+                macro += `<ac:parameter ac:name="title">${escapeXmlText(title.trim())}</ac:parameter>`;
+            }
+            
+            if (body) {
+                // Process body content as markdown (inline elements only)
+                body = body
+                    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+                    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+                    .replace(/`(.+?)`/g, "<code>$1</code>")
+                    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+                macro += `<ac:rich-text-body><p>${escapeXmlTextNodes(body)}</p></ac:rich-text-body>`;
+            }
+            
+            macro += `</ac:structured-macro>`;
+            return macro;
+        }
     );
     // Embedded images: ![[image.png]] → Confluence attachment macro (placeholder resolved after upload)
     html = html.replace(/!\[\[([^\]]+\.(png|jpg|jpeg|gif|svg|webp|bmp|ico))\]\]/gi,

@@ -105,7 +105,7 @@ The required header to bypass Atlassian's XSRF on attachments is `X-Atlassian-To
 Key transformations (in order):
 1. Strip YAML front-matter (`---...---`)
 2. Strip `%% ... %%` Obsidian comment markers (Waypoint plugin uses these)
-3. Obsidian callouts (`> [!NOTE]`) → bold label in blockquote
+3. Obsidian callouts (`> [!NOTE]`) → Confluence structured macros (`<ac:structured-macro ac:name="note">`)
 4. `![[image.png]]` → `<ac:image><ri:attachment ri:filename="..."/></ac:image>`
 5. Other `![[...]]` embeds → deleted
 6. Wiki links (`[[Page|Alias]]`, `[[File.ext]]`) — resolved to `<a href="...">` via `titleToUrl` map
@@ -276,5 +276,7 @@ Run with `npm test` (vitest).
 ## Known Bugs
 
 - **Image attachment 409 on re-push** — Uploading an image attachment that already exists on a page can still produce a 409 error in some cases. The `uploadAttachment()` method attempts to detect existing attachments via `getAttachmentId()` and use `PUT .../data` for updates, but this does not always prevent the conflict. Non-blocking: the console logs the error and sync continues.
+
+- **Callout conversion not rendering properly** — Obsidian callouts (e.g. `> [!Warning] text`) are converted to Confluence structured macros (`<ac:structured-macro ac:name="warning">`), but they don't render as expected callout boxes in Confluence. The content is still copied over correctly, but appears as plain text instead of styled info/warning/note boxes. Root cause unknown.
 
 
