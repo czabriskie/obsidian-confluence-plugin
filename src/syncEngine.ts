@@ -25,6 +25,7 @@ export type SyncDirection = "both" | "push" | "pull";
 export interface SyncResult {
     pushed: string[];
     pulled: string[];
+    deleted: string[];
     conflicts: string[];
     errors: Array<{ path: string; error: string }>;
 }
@@ -90,6 +91,7 @@ export class SyncEngine {
         const result: SyncResult = {
             pushed: [],
             pulled: [],
+            deleted: [],
             conflicts: [],
             errors: [],
         };
@@ -111,7 +113,15 @@ export class SyncEngine {
         // ensures the title space is clean regardless of processing order.
         await this.preRenameStalePages(localFiles);
 
-        // ── 2. Push local → remote ────────────────────────────────────────
+        // ── 2. Delete Confluence pages for files removed locally ───────────
+        if (direction === "both" || direction === "push") {
+            await this.deleteObsoletePages(localFiles, result);
+            if (result.deleted.length > 0) {
+                console.log(`[ConfluenceSync] Deleted ${result.deleted.length} obsolete page(s):`, result.deleted);
+            }
+        }
+
+        // ── 3. Push local → remote ────────────────────────────────────────
         // Push first so that folder pages exist in Confluence (and in folderMap)
         // before we fetch remote pages for pull.  This also means newly-pushed
         // pages will have sync records when pull runs, preventing them being
@@ -151,7 +161,7 @@ export class SyncEngine {
             }
         }
 
-        // ── 3. Collect remote pages (after push, so folderMap is up-to-date) ──
+        // ── 4. Collect remote pages (after push, so folderMap is up-to-date) ──
         let remotePages: Array<ConfluencePage & { ancestorIds: string[]; ancestorTitles: string[] }> = [];
         if (direction === "both" || direction === "pull") {
             try {
@@ -164,7 +174,7 @@ export class SyncEngine {
             }
         }
 
-        // ── 4. Pull remote → local ────────────────────────────────────────
+        // ── 5. Pull remote → local ────────────────────────────────────────
         if (direction === "both" || direction === "pull") {
             // Before pulling content pages, seed folderMap with any intermediate
             // folder pages discovered in the remote ancestor chains.  This ensures
@@ -196,7 +206,7 @@ export class SyncEngine {
         }
 
         await this.state.save();
-        console.log(`[ConfluenceSync] Done. Pushed: ${result.pushed.length}, Pulled: ${result.pulled.length}, Conflicts: ${result.conflicts.length}, Errors: ${result.errors.length}`);
+        console.log(`[ConfluenceSync] Done. Pushed: ${result.pushed.length}, Pulled: ${result.pulled.length}, Deleted: ${result.deleted.length}, Conflicts: ${result.conflicts.length}, Errors: ${result.errors.length}`);
         return result;
     }
 
@@ -513,7 +523,7 @@ export class SyncEngine {
     async pushFileDirect(file: TFile, force = false): Promise<SyncResult> {
         this._foundFolderCache.clear();
         this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
-        const result: SyncResult = { pushed: [], pulled: [], conflicts: [], errors: [] };
+        const result: SyncResult = { pushed: [], pulled: [], deleted: [], conflicts: [], errors: [] };
         try {
             if (force) {
                 const existing = this.state.get(file.path);
@@ -1023,6 +1033,70 @@ export class SyncEngine {
             rootFolder = rootFolder.slice(vaultBasePath.length).replace(/^\//, "");
         }
         return normalizePath(rootFolder);
+    }
+
+    /**
+     * Delete Confluence pages for any tracked files that no longer exist locally.
+     * Also cleans up folder pages whose local directory has been removed.
+     * Only called when direction is "both" or "push" (local vault is master).
+     */
+    private async deleteObsoletePages(
+        localFiles: TFile[],
+        result: SyncResult
+    ): Promise<void> {
+        const localPathSet = new Set(localFiles.map((f) => f.path));
+        const allRecords = this.state.all();
+
+        // ── 1. Delete pages for tracked files that no longer exist locally ──
+        for (const [vaultPath, record] of Object.entries(allRecords)) {
+            if (localPathSet.has(vaultPath)) continue;
+            if (this.isExcluded(vaultPath)) continue;
+
+            console.log(
+                `[ConfluenceSync] Deleting obsolete Confluence page "${record.confluenceTitle}" ` +
+                `(${record.confluencePageId}) — local file removed: ${vaultPath}`
+            );
+            try {
+                await this.client.deletePage(record.confluencePageId);
+                result.deleted.push(vaultPath);
+            } catch (e: any) {
+                // 404 means it's already gone — that's fine, clean up state anyway
+                if (!String(e).includes("404") && !String(e).includes("not found")) {
+                    console.error(`[ConfluenceSync] Failed to delete page ${record.confluencePageId}:`, e);
+                    result.errors.push({ path: vaultPath, error: String(e) });
+                    continue;
+                }
+                console.log(`[ConfluenceSync] Page ${record.confluencePageId} already deleted in Confluence`);
+            }
+            this.state.delete(vaultPath);
+        }
+
+        // ── 2. Delete folder pages whose local directory no longer exists ──
+        // Deletion of a parent folder page in Confluence cascades children, so we
+        // process most-specific (deepest) paths first to avoid double-delete errors.
+        const allFolders = this.state.allFolders();
+        const folderPaths = Object.keys(allFolders).sort((a, b) => b.length - a.length);
+
+        for (const dirPath of folderPaths) {
+            const localDir = this.vault.getAbstractFileByPath(dirPath);
+            if (localDir) continue; // directory still exists
+
+            const folderId = allFolders[dirPath];
+            console.log(
+                `[ConfluenceSync] Deleting obsolete Confluence folder page (${folderId}) ` +
+                `— local directory removed: ${dirPath}`
+            );
+            try {
+                await this.client.deletePage(folderId);
+            } catch (e: any) {
+                if (!String(e).includes("404") && !String(e).includes("not found")) {
+                    console.error(`[ConfluenceSync] Failed to delete folder page ${folderId}:`, e);
+                    result.errors.push({ path: dirPath, error: String(e) });
+                }
+                // Either deleted successfully or already gone — remove from state
+            }
+            this.state.deleteFolder(dirPath);
+        }
     }
 
     /**

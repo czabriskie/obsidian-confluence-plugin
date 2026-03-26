@@ -294,6 +294,7 @@ export default class ConfluenceSyncPlugin extends Plugin {
         const parts: string[] = [];
         if (result.pushed.length) parts.push(`↑ ${result.pushed.length} pushed`);
         if (result.pulled.length) parts.push(`↓ ${result.pulled.length} pulled`);
+        if (result.deleted.length) parts.push(`🗑️ ${result.deleted.length} deleted`);
         if (result.conflicts.length)
             parts.push(`⚡ ${result.conflicts.length} conflicts`);
         if (result.errors.length)
