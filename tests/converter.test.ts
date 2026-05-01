@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
     markdownToConfluenceStorage,
     confluenceStorageToMarkdown,
+    formatCommentsAsMarkdown,
+    COMMENTS_SECTION_MARKER,
 } from "../src/converter";
 
 // ─── markdownToConfluenceStorage ─────────────────────────────────────────────
@@ -27,6 +29,12 @@ describe("markdownToConfluenceStorage", () => {
         expect(markdownToConfluenceStorage("use `npm install`")).toContain(
             "<code>npm install</code>"
         );
+    });
+
+    it("escapes HTML tags inside inline code", () => {
+        const result = markdownToConfluenceStorage("Video embedded via Stream `<iframe>` tag.");
+        expect(result).toContain("<code>&lt;iframe&gt;</code>");
+        expect(result).not.toContain("<code><iframe></code>");
     });
 
     it("converts fenced code blocks to Confluence code macro", () => {
@@ -70,10 +78,59 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("<ol><li>first<ol><li>sub</li><li>sub2</li></ol></li><li>second</li></ol>");
     });
 
+    it("converts unchecked checkbox to task list", () => {
+        const md = "- [ ] Buy groceries\n- [ ] Walk the dog";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ac:task-list>");
+        expect(result).toContain("<ac:task-id>");
+        expect(result).toContain("<ac:task-status>incomplete</ac:task-status>");
+        expect(result).toContain('<span class="placeholder-inline-tasks">Buy groceries</span>');
+        expect(result).toContain('<span class="placeholder-inline-tasks">Walk the dog</span>');
+    });
+
+    it("converts checked checkbox to complete task", () => {
+        const md = "- [x] Done item";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ac:task-status>complete</ac:task-status>");
+        expect(result).toContain('<span class="placeholder-inline-tasks">Done item</span>');
+    });
+
+    it("converts mixed checkboxes", () => {
+        const md = "- [x] First\n- [ ] Second\n- [x] Third";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<ac:task-list>");
+        expect((result.match(/<ac:task>/g) || []).length).toBe(3);
+    });
+
+    it("does not convert checkboxes inside code blocks", () => {
+        const md = "```\n- [ ] not a task\n```";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).not.toContain("<ac:task-list>");
+    });
+
     it("converts links", () => {
         const md = "[click here](https://example.com)";
         const result = markdownToConfluenceStorage(md);
         expect(result).toContain('<a href="https://example.com">click here</a>');
+    });
+
+    it("auto-links bare URLs in table cells", () => {
+        const md = "| Key | Value |\n|---|---|\n| Jira | https://zontal.atlassian.net/browse/ZSPACE-32230 |";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<a href="https://zontal.atlassian.net/browse/ZSPACE-32230">');
+    });
+
+    it("auto-links bare URLs in plain text paragraphs", () => {
+        const md = "Visit https://example.com for details.";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('<a href="https://example.com">https://example.com</a>');
+    });
+
+    it("does not double-link markdown links", () => {
+        const md = "[click](https://example.com)";
+        const result = markdownToConfluenceStorage(md);
+        const matches = result.match(/href="https:\/\/example\.com"/g) || [];
+        expect(matches.length).toBe(1);
     });
 
     it("converts links with title attribute", () => {
@@ -190,6 +247,16 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("<td><p>os</p></td>");
         // separator row must not appear as a data row
         expect(result).not.toContain("<td><p>---</p></td>");
+    });
+
+    it("escapes HTML-like content in backtick-wrapped table cells", () => {
+        const md = "| Block | Purpose |\n|---|---|\n| `<script id=\"Cookiebot\">` | Consent manager |\n| `<noscript><iframe src=\"...\">` | Fallback |";
+        const result = markdownToConfluenceStorage(md);
+        // Backtick-wrapped HTML-like values must be XML-escaped, not left as raw tags
+        expect(result).toContain("&lt;script id=");
+        expect(result).toContain("&lt;noscript&gt;&lt;iframe");
+        expect(result).not.toContain("<script");
+        expect(result).not.toContain("<noscript>");
     });
 
     it("escapes XML special characters in plain text", () => {
@@ -399,6 +466,96 @@ describe("confluenceStorageToMarkdown", () => {
         const blankRuns = result.match(/\n{3,}/g);
         expect(blankRuns).toBeNull();
     });
+
+    it("converts task list to checkboxes", () => {
+        const storage = '<ac:task-list><ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">Buy milk</span></ac:task-body></ac:task><ac:task><ac:task-id>2</ac:task-id><ac:task-status>complete</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">Walk dog</span></ac:task-body></ac:task></ac:task-list>';
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("- [ ] Buy milk");
+        expect(result).toContain("- [x] Walk dog");
+    });
+
+    it("converts task list without IDs or spans (legacy format)", () => {
+        const storage = '<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>No id</ac:task-body></ac:task></ac:task-list>';
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("- [ ] No id");
+    });
+
+    it("converts tables to markdown", () => {
+        const storage = "<table><thead><tr><th><p>Name</p></th><th><p>Value</p></th></tr></thead><tbody><tr><td><p>A</p></td><td><p>1</p></td></tr><tr><td><p>B</p></td><td><p>2</p></td></tr></tbody></table>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("| Name | Value |");
+        expect(result).toContain("| --- | --- |");
+        expect(result).toContain("| A | 1 |");
+        expect(result).toContain("| B | 2 |");
+    });
+
+    it("converts tables with links in cells", () => {
+        const storage = '<table><thead><tr><th><p>Field</p></th><th><p>Link</p></th></tr></thead><tbody><tr><td><p>Jira</p></td><td><p><a href="https://example.com">ticket</a></p></td></tr></tbody></table>';
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("| Jira | [ticket](https://example.com) |");
+    });
+
+    it("converts tables without thead", () => {
+        const storage = "<table><tbody><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></tbody></table>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("| A | B |");
+        expect(result).toContain("| 1 | 2 |");
+    });
+
+    it("decodes named HTML entities (mdash, rarr, sect, etc.)", () => {
+        const storage = "<p>a &mdash; b &rarr; c &sect; d &ndash; e</p>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("a — b → c § d – e");
+    });
+
+    it("decodes numeric character references", () => {
+        const storage = "<p>&#169; &#x2603;</p>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("©");
+        expect(result).toContain("☃");
+    });
+
+    it("separates headings from surrounding content", () => {
+        const storage = "<p>Before</p><h1>Title</h1><p>After</p>";
+        const result = confluenceStorageToMarkdown(storage);
+        // Heading must be on its own line, not concatenated
+        expect(result).toMatch(/Before\n+# Title\n+After/);
+    });
+
+    it("converts attachment images to Obsidian embed", () => {
+        const storage = '<ac:image><ri:attachment ri:filename="diagram.png"/></ac:image>';
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("![[diagram.png]]");
+    });
+
+    it("converts br tags to newlines", () => {
+        const storage = "<p>line one<br/>line two</p>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("line one\nline two");
+    });
+
+    it("converts nested lists", () => {
+        const storage = "<ul><li>top<ul><li>child</li><li>child2</li></ul></li><li>other</li></ul>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("- top");
+        expect(result).toContain("  - child");
+        expect(result).toContain("  - child2");
+        expect(result).toContain("- other");
+    });
+
+    it("converts ordered lists", () => {
+        const storage = "<ol><li>first</li><li>second</li></ol>";
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("1. first");
+        expect(result).toContain("2. second");
+    });
+
+    it("converts info/note/warning macros to callouts", () => {
+        const storage = '<ac:structured-macro ac:name="note"><ac:parameter ac:name="title">Important</ac:parameter><ac:rich-text-body><p>Check this</p></ac:rich-text-body></ac:structured-macro>';
+        const result = confluenceStorageToMarkdown(storage);
+        expect(result).toContain("> [!NOTE] Important");
+        expect(result).toContain("> Check this");
+    });
 });
 
 // ─── Round-trip stability ────────────────────────────────────────────────────
@@ -423,5 +580,60 @@ describe("round-trip", () => {
         const storage = markdownToConfluenceStorage(md);
         const backToMd = confluenceStorageToMarkdown(storage);
         expect(backToMd).toContain("[example](https://example.com)");
+    });
+});
+
+// ─── Comments ───────────────────────────────────────────────────────────────────────
+
+describe("formatCommentsAsMarkdown", () => {
+    it("returns empty string for no comments", () => {
+        expect(formatCommentsAsMarkdown([])).toBe("");
+    });
+
+    it("formats a single comment with author and body", () => {
+        const result = formatCommentsAsMarkdown([
+            { author: "Alice", body: "<p>Looks good!</p>", createdAt: "2025-01-15T10:30:00Z" },
+        ]);
+        expect(result).toContain(COMMENTS_SECTION_MARKER);
+        expect(result).toContain("## Comments");
+        expect(result).toContain("> **Alice**");
+        expect(result).toContain("> Looks good!");
+    });
+
+    it("formats multiple comments", () => {
+        const result = formatCommentsAsMarkdown([
+            { author: "Alice", body: "<p>First</p>", createdAt: "2025-01-15T10:30:00Z" },
+            { author: "Bob", body: "<p>Second</p>", createdAt: "2025-01-15T11:00:00Z" },
+        ]);
+        expect(result).toContain("> **Alice**");
+        expect(result).toContain("> **Bob**");
+        expect(result).toContain("> First");
+        expect(result).toContain("> Second");
+    });
+
+    it("converts HTML in comment body to markdown", () => {
+        const result = formatCommentsAsMarkdown([
+            { author: "Eve", body: "<p>Check <strong>this</strong> out</p>", createdAt: "" },
+        ]);
+        expect(result).toContain("> Check **this** out");
+    });
+});
+
+describe("comments section stripping on push", () => {
+    it("strips comments section from markdown before converting", () => {
+        const md = `# Title\n\nSome content\n\n${COMMENTS_SECTION_MARKER}\n## Comments\n\n> **Alice** — Jan 15, 2025\n> Great work!`;
+        const storage = markdownToConfluenceStorage(md);
+        expect(storage).toContain("Title");
+        expect(storage).toContain("Some content");
+        expect(storage).not.toContain("Comments");
+        expect(storage).not.toContain("Alice");
+        expect(storage).not.toContain("Great work");
+    });
+
+    it("handles markdown with no comments section", () => {
+        const md = "# Title\n\nContent";
+        const storage = markdownToConfluenceStorage(md);
+        expect(storage).toContain("Title");
+        expect(storage).toContain("Content");
     });
 });

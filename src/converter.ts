@@ -11,6 +11,17 @@
 // Markdown → Confluence Storage Format
 // ---------------------------------------------------------------------------
 
+/** Marker that delimits the auto-generated comments section in local files. */
+export const COMMENTS_SECTION_MARKER = "%% confluence-comments %%";
+
+/** Auto-link bare URLs that aren't already inside an href or <a> tag. */
+function autoLinkUrls(text: string): string {
+    return text.replace(
+        /(?<!href=")(?<!<a[^>]*>)(https?:\/\/[^\s<>"']+)/g,
+        '<a href="$1">$1</a>'
+    );
+}
+
 /** Escape characters that are invalid in XML text nodes. */
 function escapeXmlText(text: string): string {
     return text
@@ -92,12 +103,14 @@ function convertTables(input: string): string {
 
             // Parse a row string into cell text array.
             // Strip backtick wrappers so `code` values render as plain text in cells.
+            // Escape the inner content so HTML-like values (e.g. `<script>`) don't
+            // pass through as raw tags.
             const parseCells = (row: string): string[] =>
                 row
                     .replace(/^\|/, "")
                     .replace(/\|$/, "")
                     .split("|")
-                    .map((c) => c.trim().replace(/`([^`]+)`/g, "$1"));
+                    .map((c) => c.trim().replace(/`([^`]+)`/g, (_, inner) => escapeXmlText(inner)));
 
             // Find header/separator split point
             const sepIdx = rows.findIndex(isSeparator);
@@ -109,7 +122,7 @@ function convertTables(input: string): string {
             // thead
             out += "<thead>";
             for (const row of headerRows) {
-                out += "<tr>" + parseCells(row).map((c) => `<th><p>${escapeXmlText(c)}</p></th>`).join("") + "</tr>";
+                out += "<tr>" + parseCells(row).map((c) => `<th><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></th>`).join("") + "</tr>";
             }
             out += "</thead>";
 
@@ -117,13 +130,41 @@ function convertTables(input: string): string {
             if (dataRows.length > 0) {
                 out += "<tbody>";
                 for (const row of dataRows) {
-                    out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlText(c)}</p></td>`).join("") + "</tr>";
+                    out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></td>`).join("") + "</tr>";
                 }
                 out += "</tbody>";
             }
 
             out += "</table>";
             return out;
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task list (checkbox) conversion helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts contiguous blocks of Obsidian checkbox lines (`- [ ]` / `- [x]`)
+ * into Confluence task list macros.
+ */
+function convertTaskLists(input: string): string {
+    let taskIdCounter = 1;
+    return input.replace(
+        /((?:^[ \t]*- \[[xX ]\] .+\n?)+)/gm,
+        (block) => {
+            const lines = block.replace(/\n$/, "").split("\n");
+            const tasks = lines.map((line) => {
+                const m = line.match(/^[ \t]*- \[([xX ])\] (.*)$/);
+                if (!m) return "";
+                const checked = m[1].toLowerCase() === "x";
+                const status = checked ? "complete" : "incomplete";
+                const text = escapeXmlTextNodes(m[2]);
+                const id = taskIdCounter++;
+                return `<ac:task><ac:task-id>${id}</ac:task-id><ac:task-status>${status}</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">${text}</span></ac:task-body></ac:task>`;
+            });
+            return `<ac:task-list>${tasks.join("")}</ac:task-list>`;
         }
     );
 }
@@ -210,6 +251,13 @@ export function markdownToConfluenceStorage(
 
     // Front-matter: strip YAML front-matter block (---...---) at the top
     html = html.replace(/^---[\s\S]*?---\n?/, "");
+
+    // Comments section: strip the auto-generated Confluence comments block
+    // so it is never pushed back as page body content.
+    const commentsIdx = html.indexOf(COMMENTS_SECTION_MARKER);
+    if (commentsIdx !== -1) {
+        html = html.substring(0, commentsIdx).trimEnd() + "\n";
+    }
 
     // ── Obsidian-specific syntax ──────────────────────────────────────────
     // Obsidian comment markers (%% ... %%) — strip the markers but keep content
@@ -372,21 +420,25 @@ export function markdownToConfluenceStorage(
     // that happen to be inside a fenced code block's CDATA section.
     html = applyOutsideCdata(html, convertTables);
 
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    // Inline code — escape XML chars so that angle brackets in code spans
+    // (e.g. `<iframe>`, `Array<T>`) don't produce invalid XHTML.
+    html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
 
-    // Bold
-    html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
-
-    // Italic
-    // Note: _word_ italics require a non-word-char boundary so that underscores
-    // inside identifiers (merge_requests, snake_case) are not treated as italic markers.
-    html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-    html = html.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
-
-    // Strikethrough
-    html = html.replace(/~~(.+?)~~/g, "<del>$1</del>");
+    // Bold / Italic / Strikethrough — wrapped in applyOutsideCdata so that
+    // content inside code block CDATA sections is never modified.
+    html = applyOutsideCdata(html, (segment) => {
+        // Bold
+        segment = segment.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+        segment = segment.replace(/__(.+?)__/g, "<strong>$1</strong>");
+        // Italic
+        // Note: _word_ italics require a non-word-char boundary so that underscores
+        // inside identifiers (merge_requests, snake_case) are not treated as italic markers.
+        segment = segment.replace(/\*(.+?)\*/g, "<em>$1</em>");
+        segment = segment.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
+        // Strikethrough
+        segment = segment.replace(/~~(.+?)~~/g, "<del>$1</del>");
+        return segment;
+    });
 
     // Horizontal rule
     html = html.replace(/^(?:---|\*\*\*|___)\s*$/gm, "<hr/>");
@@ -405,6 +457,11 @@ export function markdownToConfluenceStorage(
             return `<blockquote><p>${escapeXmlTextNodes(inner)}</p></blockquote>`;
         }
     );
+
+    // Task lists (checkboxes) — convert before general list conversion so
+    // `- [ ]` / `- [x]` lines don't get consumed as plain <ul> items.
+    // Confluence uses <ac:task-list> / <ac:task> / <ac:task-status> macros.
+    html = applyOutsideCdata(html, convertTaskLists);
 
     // Lists — nested unordered and ordered, respecting indentation depth.
     // applyOutsideCdata ensures list-like lines inside code blocks are not converted.
@@ -450,8 +507,8 @@ export function markdownToConfluenceStorage(
             // Escape only the text nodes, leaving the tags intact.
             output.push(`<p>${escapeXmlTextNodes(trimmed)}</p>`);
         } else {
-            // Plain text — escape XML special chars
-            output.push(`<p>${escapeXmlText(trimmed)}</p>`);
+            // Plain text — escape XML special chars, then auto-link bare URLs
+            output.push(`<p>${autoLinkUrls(escapeXmlText(trimmed))}</p>`);
         }
     }
 
@@ -462,11 +519,242 @@ export function markdownToConfluenceStorage(
 // Confluence Storage Format → Markdown
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// HTML → Markdown helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode common HTML named entities and numeric character references to their
+ * Unicode equivalents.
+ */
+function decodeHtmlEntities(text: string): string {
+    const NAMED: Record<string, string> = {
+        "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+        "&#39;": "'", "&apos;": "'", "&nbsp;": " ",
+        "&mdash;": "—", "&ndash;": "–",
+        "&rarr;": "→", "&larr;": "←", "&darr;": "↓", "&uarr;": "↑", "&harr;": "↔",
+        "&laquo;": "«", "&raquo;": "»", "&lsaquo;": "‹", "&rsaquo;": "›",
+        "&ldquo;": "\u201C", "&rdquo;": "\u201D", "&lsquo;": "\u2018", "&rsquo;": "\u2019",
+        "&bull;": "•", "&hellip;": "…", "&sect;": "§",
+        "&copy;": "©", "&reg;": "®", "&trade;": "™",
+        "&deg;": "°", "&plusmn;": "±", "&times;": "×", "&divide;": "÷",
+        "&frac12;": "½", "&frac14;": "¼", "&frac34;": "¾",
+    };
+    for (const [entity, char] of Object.entries(NAMED)) {
+        text = text.replaceAll(entity, char);
+    }
+    // Numeric character references
+    text = text.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+    text = text.replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
+    return text;
+}
+
+/**
+ * Find the index *after* the closing tag that matches the open tag at position
+ * `searchFrom` (which points just after the opening tag).  Handles nesting.
+ * Returns -1 if no match is found.
+ */
+function findClosingTag(html: string, tag: string, searchFrom: number): number {
+    let depth = 1;
+    const re = new RegExp(`<(/?)${tag}(?:\\s[^>]*)?>`, "gi");
+    re.lastIndex = searchFrom;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) {
+        if (m[1] === "/") {
+            depth--;
+            if (depth === 0) return m.index + m[0].length;
+        } else {
+            depth++;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Convert inline HTML (bold, italic, code, links) to markdown equivalents and
+ * strip any remaining HTML tags.
+ */
+function inlineHtmlToMd(text: string): string {
+    text = text.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**");
+    text = text.replace(/<b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**");
+    text = text.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
+    text = text.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
+    text = text.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
+    text = text.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+    text = text.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
+    text = text.replace(/<br\s*\/?>/gi, " ");
+    text = text.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "$1");
+    text = text.replace(/<[^>]+>/g, "");
+    return text.replace(/\n+/g, " ").trim();
+}
+
+/**
+ * Convert a Confluence `<table>` element's inner HTML to a GFM markdown table.
+ */
+function confluenceTableToMarkdown(tableHtml: string): string {
+    function extractRows(html: string): string[][] {
+        const rows: string[][] = [];
+        const trRe = /<tr[^>]*>/gi;
+        let trMatch: RegExpExecArray | null;
+        while ((trMatch = trRe.exec(html)) !== null) {
+            const trStart = trMatch.index + trMatch[0].length;
+            const trEnd = findClosingTag(html, "tr", trStart);
+            if (trEnd === -1) continue;
+            const trInner = html.substring(trStart, trEnd - "</tr>".length);
+
+            const cells: string[] = [];
+            const cellRe = /<(th|td)[^>]*>/gi;
+            let cellMatch: RegExpExecArray | null;
+            while ((cellMatch = cellRe.exec(trInner)) !== null) {
+                const tag = cellMatch[1];
+                const cStart = cellMatch.index + cellMatch[0].length;
+                const cEnd = findClosingTag(trInner, tag, cStart);
+                if (cEnd === -1) continue;
+                const raw = trInner.substring(cStart, cEnd - `</${tag}>`.length);
+                cells.push(decodeHtmlEntities(inlineHtmlToMd(raw)));
+                cellRe.lastIndex = cEnd;
+            }
+            if (cells.length > 0) rows.push(cells);
+            trRe.lastIndex = trEnd;
+        }
+        return rows;
+    }
+
+    // Collect rows from <thead> then <tbody>, falling back to bare <tr>s
+    let rows: string[][] = [];
+    const theadMatch = tableHtml.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i);
+    if (theadMatch) rows.push(...extractRows(theadMatch[1]));
+    const tbodyMatch = tableHtml.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+    if (tbodyMatch) rows.push(...extractRows(tbodyMatch[1]));
+    if (rows.length === 0) rows = extractRows(tableHtml);
+    if (rows.length === 0) return "";
+
+    // Pad all rows to the same number of columns
+    const maxCols = Math.max(...rows.map((r) => r.length));
+    rows.forEach((r) => { while (r.length < maxCols) r.push(""); });
+
+    let out = "\n\n";
+    out += "| " + rows[0].join(" | ") + " |\n";
+    out += "| " + rows[0].map(() => "---").join(" | ") + " |\n";
+    for (let i = 1; i < rows.length; i++) {
+        out += "| " + rows[i].join(" | ") + " |\n";
+    }
+    return out + "\n";
+}
+
+/**
+ * Convert a Confluence `<ul>` or `<ol>` element (including nested lists)
+ * into indented markdown list lines.
+ */
+function confluenceListToMarkdown(listHtml: string, indent: number = 0): string {
+    const isOrdered = /^<ol/i.test(listHtml.trim());
+    const tag = isOrdered ? "ol" : "ul";
+
+    // Strip outer tag to get inner content
+    const openMatch = listHtml.match(new RegExp(`^<${tag}[^>]*>`, "i"));
+    if (!openMatch) return listHtml;
+    const innerStart = openMatch[0].length;
+    const closeIdx = findClosingTag(listHtml, tag, innerStart);
+    if (closeIdx === -1) return listHtml;
+    const inner = listHtml.substring(innerStart, closeIdx - `</${tag}>`.length);
+
+    // Find each top-level <li> in inner
+    const liRe = /<li[^>]*>/gi;
+    const items: string[] = [];
+    let liMatch: RegExpExecArray | null;
+    while ((liMatch = liRe.exec(inner)) !== null) {
+        const contentStart = liMatch.index + liMatch[0].length;
+        const endIdx = findClosingTag(inner, "li", contentStart);
+        if (endIdx === -1) break;
+        items.push(inner.substring(contentStart, endIdx - "</li>".length));
+        liRe.lastIndex = endIdx;
+    }
+
+    const prefix = "  ".repeat(indent);
+    const lines: string[] = [];
+    items.forEach((item, idx) => {
+        let text = item;
+        let nestedMd = "";
+
+        // Find and extract nested <ul>/<ol> lists
+        const nestedRe = /<(ul|ol)[^>]*>/gi;
+        const nesteds: Array<{ start: number; end: number; html: string }> = [];
+        let nm: RegExpExecArray | null;
+        while ((nm = nestedRe.exec(text)) !== null) {
+            const nTag = nm[1];
+            const nStart = nm.index;
+            const nEnd = findClosingTag(text, nTag, nm.index + nm[0].length);
+            if (nEnd === -1) continue;
+            nesteds.push({ start: nStart, end: nEnd, html: text.substring(nStart, nEnd) });
+            nestedRe.lastIndex = nEnd;
+        }
+
+        // Remove nested list HTML from item text (process from end to preserve indices)
+        for (let i = nesteds.length - 1; i >= 0; i--) {
+            nestedMd = confluenceListToMarkdown(nesteds[i].html, indent + 1) +
+                (nestedMd ? "\n" + nestedMd : "");
+            text = text.substring(0, nesteds[i].start) + text.substring(nesteds[i].end);
+        }
+
+        const cleanText = decodeHtmlEntities(inlineHtmlToMd(text));
+        const marker = isOrdered ? `${idx + 1}.` : "-";
+        lines.push(`${prefix}${marker} ${cleanText}`);
+        if (nestedMd) lines.push(nestedMd);
+    });
+
+    return lines.join("\n");
+}
+
+/**
+ * Find and replace all top-level occurrences of a given tag using proper
+ * nesting-aware matching, applying `convert` to each match.
+ */
+function replaceTopLevelTag(
+    html: string,
+    tag: string,
+    convert: (matched: string) => string
+): string {
+    const re = new RegExp(`<${tag}[^>]*>`, "gi");
+    let result = "";
+    let lastEnd = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) {
+        const startIdx = m.index;
+        const closeIdx = findClosingTag(html, tag, m.index + m[0].length);
+        if (closeIdx === -1) continue;
+        result += html.substring(lastEnd, startIdx);
+        result += convert(html.substring(startIdx, closeIdx));
+        lastEnd = closeIdx;
+        re.lastIndex = closeIdx;
+    }
+    result += html.substring(lastEnd);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Confluence Storage Format → Markdown  (public)
+// ---------------------------------------------------------------------------
+
 export function confluenceStorageToMarkdown(storage: string): string {
     let md = storage;
 
-    // Code macro — Confluence may emit parameters in any order and with extra
-    // attributes, so we extract the language param separately if present.
+    // ── Structured macros (must be processed before generic tag stripping) ──
+
+    // Task lists → Obsidian checkboxes
+    md = md.replace(
+        /<ac:task-list>([\s\S]*?)<\/ac:task-list>/gi,
+        (_, inner) => {
+            return inner.replace(
+                /<ac:task>\s*(?:<ac:task-id>\d+<\/ac:task-id>\s*)?<ac:task-status>([^<]+)<\/ac:task-status>\s*<ac:task-body>\s*(?:<span[^>]*>)?([\s\S]*?)(?:<\/span>)?\s*<\/ac:task-body>\s*<\/ac:task>/gi,
+                (_: string, status: string, body: string) => {
+                    const checked = status.trim().toLowerCase() === "complete";
+                    return `- [${checked ? "x" : " "}] ${body.trim()}\n`;
+                }
+            );
+        }
+    );
+
+    // Code macro → fenced code block (extract before other transforms)
     md = md.replace(
         /<ac:structured-macro ac:name="code"[^>]*>([\s\S]*?)<\/ac:structured-macro>/g,
         (_, inner) => {
@@ -474,19 +762,59 @@ export function confluenceStorageToMarkdown(storage: string): string {
             const lang = langMatch ? langMatch[1].trim() : "";
             const cdataMatch = inner.match(/<ac:plain-text-body><!\[CDATA\[([\s\S]*?)\]\]><\/ac:plain-text-body>/);
             const code = cdataMatch ? cdataMatch[1] : "";
-            return "```" + lang + "\n" + code + "```";
+            return "\n\n```" + lang + "\n" + code + "```\n\n";
         }
     );
 
-    // Headings
-    md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "# $1");
-    md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "## $1");
-    md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "### $1");
-    md = md.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, "#### $1");
-    md = md.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, "##### $1");
-    md = md.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, "###### $1");
+    // Info / note / warning / tip macros → Obsidian callouts
+    md = md.replace(
+        /<ac:structured-macro ac:name="(info|note|warning|tip)"[^>]*>([\s\S]*?)<\/ac:structured-macro>/g,
+        (_, type, inner) => {
+            const typeMap: Record<string, string> = {
+                info: "INFO", note: "NOTE", warning: "WARNING", tip: "TIP",
+            };
+            const calloutType = typeMap[type] || type.toUpperCase();
+            const titleMatch = inner.match(/<ac:parameter ac:name="title">([^<]+)<\/ac:parameter>/);
+            const title = titleMatch ? " " + titleMatch[1].trim() : "";
+            const bodyMatch = inner.match(/<ac:rich-text-body>([\s\S]*?)<\/ac:rich-text-body>/);
+            let body = bodyMatch ? inlineHtmlToMd(bodyMatch[1]).trim() : "";
+            let result = `> [!${calloutType}]${title}`;
+            if (body) {
+                result += "\n" + body.split("\n").map((l: string) => `> ${l}`).join("\n");
+            }
+            return "\n\n" + result + "\n\n";
+        }
+    );
 
-    // Bold / Italic / Strikethrough / Code
+    // Strip any remaining structured macros
+    md = md.replace(/<ac:structured-macro[^>]*>[\s\S]*?<\/ac:structured-macro>/g, "");
+
+    // ── Images ────────────────────────────────────────────────────────────
+
+    // Attachment images → ![[filename]]
+    md = md.replace(
+        /<ac:image[^>]*>\s*<ri:attachment ri:filename="([^"]+)"[^/]*\/>\s*<\/ac:image>/gi,
+        "![[$1]]"
+    );
+
+    // URL images → ![](url)
+    md = md.replace(/<ac:image[^>]*>\s*<ri:url ri:value="([^"]+)"[^/]*\/>\s*<\/ac:image>/gi, "![]($1)");
+
+    // ── Tables (nesting-aware) ────────────────────────────────────────────
+
+    md = replaceTopLevelTag(md, "table", confluenceTableToMarkdown);
+
+    // ── Headings (add surrounding newlines for separation) ────────────────
+
+    md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n\n# $1\n\n");
+    md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n\n## $1\n\n");
+    md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n\n### $1\n\n");
+    md = md.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, "\n\n#### $1\n\n");
+    md = md.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, "\n\n##### $1\n\n");
+    md = md.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, "\n\n###### $1\n\n");
+
+    // ── Inline formatting ─────────────────────────────────────────────────
+
     md = md.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**");
     md = md.replace(/<b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**");
     md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
@@ -494,46 +822,235 @@ export function confluenceStorageToMarkdown(storage: string): string {
     md = md.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
     md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
 
+    // ── Block elements ────────────────────────────────────────────────────
+
     // Blockquote
     md = md.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi, (_, inner) => {
-        return inner.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "> $1");
+        const text = inner.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "$1").trim();
+        return "\n\n" + text.split("\n").map((l: string) => `> ${l}`).join("\n") + "\n\n";
     });
 
-    // Lists
-    md = md.replace(/<ul[^>]*>([\s\S]*?)<\/ul>/gi, (_, inner) => {
-        return inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n");
-    });
-    md = md.replace(/<ol[^>]*>([\s\S]*?)<\/ol>/gi, (_, inner) => {
-        let idx = 0;
-        return inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_: string, text: string) => `${++idx}. ${text}\n`);
-    });
-
-    // Images
-    md = md.replace(/<ac:image[^>]*><ri:url ri:value="([^"]+)"[^/]*\/><\/ac:image>/gi, "![]($1)");
+    // Lists (nesting-aware)
+    md = replaceTopLevelTag(md, "ul", (html) => "\n\n" + confluenceListToMarkdown(html) + "\n\n");
+    md = replaceTopLevelTag(md, "ol", (html) => "\n\n" + confluenceListToMarkdown(html) + "\n\n");
 
     // Links
     md = md.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
 
     // Horizontal rule
-    md = md.replace(/<hr\s*\/?>/gi, "---");
+    md = md.replace(/<hr\s*\/?>/gi, "\n\n---\n\n");
 
-    // Paragraphs
+    // Line breaks
+    md = md.replace(/<br\s*\/?>/gi, "\n");
+
+    // Paragraphs → content + double newline
     md = md.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "$1\n\n");
 
-    // Strip any remaining HTML tags
+    // Strip any remaining HTML tags (colgroup, col, div, span, etc.)
     md = md.replace(/<[^>]+>/g, "");
 
-    // Decode common HTML entities
-    md = md
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
+    // ── Entity decoding ───────────────────────────────────────────────────
 
-    // Collapse excessive blank lines
+    md = decodeHtmlEntities(md);
+
+    // ── Whitespace cleanup ────────────────────────────────────────────────
+
     md = md.replace(/\n{3,}/g, "\n\n").trim();
 
     return md;
+}
+
+// ---------------------------------------------------------------------------
+// Inline comment marker preservation
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract inline comment markers from a Confluence storage-format body.
+ * Returns an array of { ref, text } objects where `ref` is the UUID and
+ * `text` is the plain text content inside the marker (HTML tags stripped).
+ */
+function extractInlineCommentMarkers(
+    storageBody: string
+): Array<{ ref: string; markedHtml: string; plainText: string }> {
+    const markers: Array<{ ref: string; markedHtml: string; plainText: string }> = [];
+    const re = /<ac:inline-comment-marker\s+ac:ref="([^"]+)">([\s\S]*?)<\/ac:inline-comment-marker>/g;
+    let m;
+    while ((m = re.exec(storageBody)) !== null) {
+        const ref = m[1];
+        const markedHtml = m[2];
+        // Strip HTML tags to get plain text for matching
+        const plainText = markedHtml.replace(/<[^>]+>/g, "").trim();
+        if (plainText) {
+            markers.push({ ref, markedHtml, plainText });
+        }
+    }
+    return markers;
+}
+
+/**
+ * Strip all inline comment marker tags from a Confluence storage body,
+ * keeping only the inner content. Used for clean comparison.
+ */
+export function stripInlineCommentMarkers(storageBody: string): string {
+    return storageBody.replace(
+        /<ac:inline-comment-marker\s+ac:ref="[^"]*">([\s\S]*?)<\/ac:inline-comment-marker>/g,
+        "$1"
+    );
+}
+
+/**
+ * Re-apply inline comment markers from an old Confluence storage body into
+ * a new one. For each marker found in `oldBody`, searches for the same
+ * plain text in `newBody` and wraps the first match with the marker tag.
+ *
+ * This preserves inline comments when pushing updated content, as long as
+ * the commented text still exists (possibly wrapped in different HTML tags).
+ */
+export function preserveInlineCommentMarkers(
+    oldBody: string,
+    newBody: string
+): string {
+    const markers = extractInlineCommentMarkers(oldBody);
+    if (markers.length === 0) return newBody;
+
+    let result = newBody;
+    for (const { ref, plainText } of markers) {
+        // Skip if this marker ref is already in the new body
+        if (result.includes(`ac:ref="${ref}"`)) continue;
+
+        // Escape regex special chars in the plain text
+        const escaped = plainText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        // Try to find the plain text inside an HTML tag's content in the new body.
+        // We look for the text that might be inside tags like <p>, <strong>, <td>, etc.
+        // Strategy: find the text as a substring and wrap the innermost occurrence.
+        const textIdx = result.indexOf(plainText);
+        if (textIdx !== -1) {
+            // Wrap just the plain text with the marker
+            result =
+                result.substring(0, textIdx) +
+                `<ac:inline-comment-marker ac:ref="${ref}">${plainText}</ac:inline-comment-marker>` +
+                result.substring(textIdx + plainText.length);
+            continue;
+        }
+
+        // Fallback: try matching with whitespace flexibility
+        const flexPattern = new RegExp(
+            escaped.replace(/\s+/g, "\\s+")
+        );
+        const flexMatch = flexPattern.exec(result);
+        if (flexMatch) {
+            const idx = flexMatch.index;
+            const matchedText = flexMatch[0];
+            result =
+                result.substring(0, idx) +
+                `<ac:inline-comment-marker ac:ref="${ref}">${matchedText}</ac:inline-comment-marker>` +
+                result.substring(idx + matchedText.length);
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Comment formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a map of inline comment marker ref UUIDs → highlighted plain text
+ * from a Confluence storage-format body.
+ */
+export function extractInlineMarkerTexts(
+    storageBody: string
+): Map<string, string> {
+    const map = new Map<string, string>();
+    const re = /<ac:inline-comment-marker\s+ac:ref="([^"]+)">([\s\S]*?)<\/ac:inline-comment-marker>/g;
+    let m;
+    while ((m = re.exec(storageBody)) !== null) {
+        const plainText = m[2].replace(/<[^>]+>/g, "").trim();
+        if (plainText) {
+            map.set(m[1], plainText);
+        }
+    }
+    return map;
+}
+
+/**
+ * Find the 1-based line and column of `needle` in `text`.
+ * Returns `{ line, col }` or null if not found.
+ */
+function findTextPosition(
+    text: string,
+    needle: string
+): { line: number; col: number } | null {
+    const idx = text.indexOf(needle);
+    if (idx === -1) return null;
+    const before = text.substring(0, idx);
+    const line = before.split("\n").length;
+    const lastNewline = before.lastIndexOf("\n");
+    const col = idx - lastNewline; // 1-based (distance from last newline)
+    return { line, col };
+}
+
+/**
+ * Format Confluence page comments as a markdown section to append to a
+ * pulled file.  The section is wrapped in Obsidian comment markers (%%)
+ * so the push converter can strip it before uploading.
+ *
+ * Each comment is rendered as a blockquote with the author and date.
+ * Inline comments include the highlighted text and its position (line:col)
+ * in the local markdown for easy correlation.
+ */
+export function formatCommentsAsMarkdown(
+    comments: Array<{ author: string; body: string; createdAt: string; markerRef?: string }>,
+    storageBody?: string,
+    localMarkdown?: string,
+): string {
+    if (comments.length === 0) return "";
+
+    // Build marker ref → highlighted text map if we have the storage body
+    const markerTexts = storageBody
+        ? extractInlineMarkerTexts(storageBody)
+        : new Map<string, string>();
+
+    const lines: string[] = [
+        "",
+        COMMENTS_SECTION_MARKER,
+        "## Comments",
+        "",
+    ];
+
+    for (const c of comments) {
+        const date = c.createdAt
+            ? new Date(c.createdAt).toLocaleString("en-US", {
+                  year: "numeric", month: "short", day: "numeric",
+                  hour: "2-digit", minute: "2-digit",
+              })
+            : "";
+        const bodyMd = confluenceStorageToMarkdown(c.body).trim();
+
+        // Build location info for inline comments
+        let locationInfo = "";
+        if (c.markerRef) {
+            const highlightedText = markerTexts.get(c.markerRef);
+            if (highlightedText && localMarkdown) {
+                const pos = findTextPosition(localMarkdown, highlightedText);
+                if (pos) {
+                    locationInfo = ` \u{1F4CC} L${pos.line}:${pos.col} \u201C${highlightedText}\u201D`;
+                } else {
+                    locationInfo = ` \u{1F4CC} \u201C${highlightedText}\u201D`;
+                }
+            } else if (highlightedText) {
+                locationInfo = ` \u{1F4CC} \u201C${highlightedText}\u201D`;
+            }
+        }
+
+        lines.push(`> **${c.author}** \u2014 ${date}${locationInfo}`);
+        for (const bodyLine of bodyMd.split("\n")) {
+            lines.push(`> ${bodyLine}`);
+        }
+        lines.push("");
+    }
+
+    return lines.join("\n");
 }

@@ -23,6 +23,14 @@ export interface ConfluenceSpace {
     id: number;
 }
 
+export interface ConfluenceComment {
+    id: string;
+    author: string;
+    body: string;       // storage format HTML
+    createdAt: string;   // ISO timestamp
+    markerRef?: string;  // UUID linking to an inline comment marker in the page body
+}
+
 export interface ConfluencePageChild {
     id: string;
     title: string;
@@ -101,10 +109,6 @@ export class ConfluenceClient {
                 expand: "version,ancestors",
             });
 
-            if (parentId) {
-                query.set("ancestors", parentId);
-            }
-
             const data = await this.request<{
                 results: Array<{
                     id: string;
@@ -170,12 +174,6 @@ export class ConfluenceClient {
             expand: "body.storage,version,space,ancestors,history,history.lastUpdated",
         });
 
-        // Scope the search to direct children of the parent when provided.
-        // This prevents matching same-titled pages elsewhere in the space.
-        if (parentId) {
-            query.set("ancestors", parentId);
-        }
-
         const data = await this.request<{
             results: Array<{
                 id: string;
@@ -191,10 +189,14 @@ export class ConfluenceClient {
 
         if (data.results.length === 0) return null;
 
-        // Secondary client-side filter as a safety net
+        // When a parentId is specified, only return a page whose immediate
+        // parent matches. Do NOT fall back to an arbitrary result — that would
+        // silently return a same-titled page under the wrong parent.
         const match = parentId
-            ? data.results.find((r) => r.ancestors.at(-1)?.id === parentId) ?? data.results[0]
+            ? data.results.find((r) => r.ancestors.at(-1)?.id === parentId)
             : data.results[0];
+
+        if (!match) return null;
 
         return {
             id: match.id,
@@ -400,6 +402,50 @@ export class ConfluenceClient {
 
         const json = JSON.parse(responseText) as { results?: Array<{ id: string }> };
         return json.results?.[0]?.id ?? "";
+    }
+
+    /**
+     * Fetch all comments on a page, ordered oldest → newest.
+     * Returns an empty array if the page has no comments.
+     */
+    async getPageComments(pageId: string): Promise<ConfluenceComment[]> {
+        const comments: ConfluenceComment[] = [];
+        let start = 0;
+        const limit = 50;
+
+        while (true) {
+            const query = new URLSearchParams({
+                expand: "body.storage,version,history,extensions.inlineProperties",
+                start: String(start),
+                limit: String(limit),
+            });
+
+            const data = await this.request<{
+                results: Array<{
+                    id: string;
+                    version: { by: { displayName: string }; when: string };
+                    body: { storage: { value: string } };
+                    history: { createdDate: string; createdBy: { displayName: string } };
+                    extensions?: { inlineProperties?: { markerRef?: string } };
+                }>;
+                _links: { next?: string };
+            }>(`/content/${pageId}/child/comment?${query}`);
+
+            for (const r of data.results) {
+                comments.push({
+                    id: r.id,
+                    author: r.history?.createdBy?.displayName ?? r.version?.by?.displayName ?? "Unknown",
+                    body: r.body.storage.value,
+                    createdAt: r.history?.createdDate ?? r.version?.when ?? "",
+                    markerRef: r.extensions?.inlineProperties?.markerRef,
+                });
+            }
+
+            if (!data._links.next) break;
+            start += limit;
+        }
+
+        return comments;
     }
 
     /** Retrieve a space by key to validate connectivity. */

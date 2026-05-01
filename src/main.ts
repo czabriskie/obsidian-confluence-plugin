@@ -82,12 +82,25 @@ export default class ConfluenceSyncPlugin extends Plugin {
 
         this.addCommand({
             id: "confluence-force-push-current",
-            name: "Force push current file to Confluence (ignore cached hash)",
+            name: "Force push current file (reconcile with Confluence first)",
             checkCallback: (checking) => {
                 const file = this.app.workspace.getActiveFile();
                 if (!file || file.extension !== "md") return false;
                 if (!checking) {
                     this.pushCurrentFile(file, true);
+                }
+                return true;
+            },
+        });
+
+        this.addCommand({
+            id: "confluence-force-pull-current",
+            name: "Force pull current file (reconcile with Confluence)",
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== "md") return false;
+                if (!checking) {
+                    this.pullCurrentFile(file);
                 }
                 return true;
             },
@@ -326,11 +339,13 @@ export default class ConfluenceSyncPlugin extends Plugin {
             this.settings
         );
 
-        new Notice(`🔄 ${force ? "Force pushing" : "Pushing"} ${file.basename}…`);
+        new Notice(`🔄 ${force ? "Reconciling & pushing" : "Pushing"} ${file.basename}…`);
         try {
             const result = await engine.pushFileDirect(file, force);
             if (result.errors.length) {
                 new Notice(`❌ Push failed: ${result.errors[0].error}`);
+            } else if (result.conflicts.length > 0) {
+                new Notice(`⚠️ ${file.basename}: local and remote differ — conflict markers inserted. Resolve and push.`);
             } else if (result.pushed.length === 0) {
                 new Notice(`⏭️ ${file.basename} is already up to date`);
             } else {
@@ -340,7 +355,36 @@ export default class ConfluenceSyncPlugin extends Plugin {
             new Notice(`❌ Push failed: ${e}`);
         }
     }
-}
+    private async pullCurrentFile(file: TFile): Promise<void> {
+        const client = this.getClient();
+        if (!client) {
+            new Notice("⚠️ Confluence Sync: Configure your Confluence settings first.");
+            return;
+        }
+
+        const engine = new SyncEngine(
+            this.app.vault,
+            client,
+            this.stateManager,
+            this.settings
+        );
+
+        new Notice(`🔄 Pulling ${file.basename} from Confluence…`);
+        try {
+            const result = await engine.pullFileDirect(file);
+            if (result.errors.length) {
+                new Notice(`❌ Pull failed: ${result.errors[0].error}`);
+            } else if (result.pulled.length === 0) {
+                new Notice(`⏭️ ${file.basename} — no remote page found`);
+            } else if (result.conflicts.length > 0) {
+                new Notice(`⚠️ ${file.basename}: local and remote differ — conflict markers inserted. Resolve and push.`);
+            } else {
+                new Notice(`✅ ${file.basename} is up to date (comments refreshed)`);
+            }
+        } catch (e) {
+            new Notice(`❌ Pull failed: ${e}`);
+        }
+    }}
 
 // ── Error detail modal ─────────────────────────────────────────────────────
 

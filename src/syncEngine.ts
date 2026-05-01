@@ -15,9 +15,14 @@ import {
     markdownToConfluenceStorage,
     confluenceStorageToMarkdown,
     extractEmbeddedImages,
+    COMMENTS_SECTION_MARKER,
+    formatCommentsAsMarkdown,
+    preserveInlineCommentMarkers,
+    stripInlineCommentMarkers,
 } from "./converter";
 import { SyncStateManager, SyncRecord } from "./syncStateManager";
 import { ConfluenceSyncSettings } from "./settings";
+import { ConfluenceComment } from "./confluenceClient";
 
 export type ConflictStrategy = "local" | "remote" | "newer";
 export type SyncDirection = "both" | "push" | "pull";
@@ -218,6 +223,14 @@ export class SyncEngine {
         force = false
     ): Promise<boolean> {
         const content = await this.vault.read(file);
+
+        // Block push if file contains unresolved conflict markers
+        if (content.includes("<<<<<<< LOCAL") || content.includes(">>>>>>> CONFLUENCE")) {
+            throw new Error(
+                `"${file.basename}" has unresolved conflict markers. Resolve them before syncing.`
+            );
+        }
+
         const record = this.state.get(file.path);
 
         // Check if this file was moved from another path — match by title against
@@ -247,7 +260,10 @@ export class SyncEngine {
                     throw e;
                 }
 
-                const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
+                const storageBody = preserveInlineCommentMarkers(
+                    remotePage.body,
+                    markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file))
+                );
                 const parentToUse = newParentId ?? remotePage.parentId;
                 console.log(`[ConfluenceSync] Re-parenting "${title}" from parent ${oldRecord.confluenceParentId} → ${parentToUse}`);
 
@@ -267,9 +283,10 @@ export class SyncEngine {
                     confluenceVersion: page.version,
                     confluenceParentId: page.parentId,
                     lastSyncedAt: new Date().toISOString(),
-                    contentHash: SyncStateManager.hash(page.body),
+                    contentHash: SyncStateManager.hash(storageBody),
                 });
                 await this.uploadPageImages(page.id, content, file);
+                await this.refreshLocalComments(file, page.id);
                 return true;
             }
         }
@@ -302,8 +319,9 @@ export class SyncEngine {
                     confluenceVersion: updated.version,
                     confluenceParentId: updated.parentId,
                     lastSyncedAt: new Date().toISOString(),
-                    contentHash: SyncStateManager.hash(updated.body),
+                    contentHash: SyncStateManager.hash(storageBody),
                 });
+                await this.refreshLocalComments(file, updated.id);
                 return true;
             }
 
@@ -377,8 +395,9 @@ export class SyncEngine {
                             confluenceVersion: existing.version,
                             confluenceParentId: existing.parentId,
                             lastSyncedAt: new Date().toISOString(),
-                            contentHash: SyncStateManager.hash(existing.body),
+                            contentHash: SyncStateManager.hash(storageBody),
                         });
+                        await this.refreshLocalComments(file, existing.id);
                         return true;
                     }
                 }
@@ -390,9 +409,10 @@ export class SyncEngine {
                 confluenceVersion: page.version,
                 confluenceParentId: page.parentId,
                 lastSyncedAt: new Date().toISOString(),
-                contentHash: SyncStateManager.hash(page.body),
+                contentHash: SyncStateManager.hash(storageBody),
             });
             await this.uploadPageImages(page.id, content, file);
+            await this.refreshLocalComments(file, page.id);
             return true;
         }
         // against the stored hash (which is always a storage-body hash).
@@ -476,7 +496,11 @@ export class SyncEngine {
             console.log(`[ConfluenceSync] Re-parenting "${remotePage.title}" to parent ${expectedParentId}`);
         }
 
-        const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
+        const plainStorageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
+        const storageBody = preserveInlineCommentMarkers(
+            remotePage.body,
+            plainStorageBody
+        );
         const title = this.titleFromFile(file);
         let page;
         try {
@@ -504,16 +528,49 @@ export class SyncEngine {
             }
             throw e;
         }
+        // Store the hash of the *plain* conversion (without inline comment markers)
+        // because the change-detection check computes hash(markdownToConfluenceStorage(...))
+        // — without markers. Using the same basis prevents false re-pushes.
         this.state.set(file.path, {
             confluencePageId: page.id,
             confluenceTitle: page.title,
             confluenceVersion: page.version,
             confluenceParentId: page.parentId,
             lastSyncedAt: new Date().toISOString(),
-            contentHash: SyncStateManager.hash(page.body),
+            contentHash: SyncStateManager.hash(plainStorageBody),
         });
         await this.uploadPageImages(page.id, content, file);
+        await this.refreshLocalComments(file, page.id);
         return true;
+    }
+
+    /**
+     * Re-fetch Confluence comments and ensure they're appended to the local file.
+     * Strips any existing comments section first to avoid duplicates.
+     */
+    private async refreshLocalComments(file: TFile, pageId: string): Promise<void> {
+        try {
+            const remotePage = await this.client.getPage(pageId);
+            const comments = await this.client.getPageComments(pageId);
+
+            const localRaw = await this.vault.read(file);
+            const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
+            const contentWithoutComments = (markerIdx !== -1
+                ? localRaw.substring(0, markerIdx)
+                : localRaw
+            ).trimEnd();
+
+            const commentsSection = comments.length > 0
+                ? formatCommentsAsMarkdown(comments, remotePage.body, contentWithoutComments)
+                : "";
+
+            const newContent = contentWithoutComments + commentsSection;
+            if (newContent !== localRaw) {
+                await this.vault.modify(file, newContent);
+            }
+        } catch (e) {
+            console.warn(`[ConfluenceSync] Failed to refresh comments for "${file.path}":`, e);
+        }
     }
 
     /**
@@ -526,50 +583,81 @@ export class SyncEngine {
         const result: SyncResult = { pushed: [], pulled: [], deleted: [], conflicts: [], errors: [] };
         try {
             if (force) {
-                const existing = this.state.get(file.path);
-                console.log(`[ConfluenceSync] Force push: file="${file.path}", hasRecord=${!!existing}, pageId=${existing?.confluencePageId}`);
-                if (existing) {
-                    const content = await this.vault.read(file);
-                    const storageBody = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
-                    console.log(`[ConfluenceSync] Force push: fetching remote page ${existing.confluencePageId}`);
-                    let remotePage;
-                    try {
-                        remotePage = await this.client.getPage(existing.confluencePageId);
-                    } catch (e: any) {
-                        if (String(e).includes("404") || String(e).includes("not found") || String(e).includes("NotFoundException")) {
-                            console.log(`[ConfluenceSync] Force push: remote page deleted, clearing record and recreating`);
-                            this.state.delete(file.path);
-                            const pushed = await this.pushFile(file, result, false);
-                            if (pushed) result.pushed.push(file.path);
-                            await this.state.save();
-                            return result;
-                        }
-                        throw e;
-                    }
-                    console.log(`[ConfluenceSync] Force push: calling updatePage v${remotePage.version}`);
-                    const page = await this.client.updatePage(
-                        existing.confluencePageId,
-                        existing.confluenceTitle,
-                        storageBody,
-                        remotePage.version,
-                        remotePage.parentId
-                    );
-                    console.log(`[ConfluenceSync] Force push: success, new version ${page.version}`);
-                    this.state.set(file.path, {
-                        confluencePageId: page.id,
-                        confluenceTitle: page.title,
-                        confluenceVersion: page.version,
-                        confluenceParentId: page.parentId,
-                        lastSyncedAt: new Date().toISOString(),
-                        contentHash: SyncStateManager.hash(page.body),
-                    });
-                    await this.uploadPageImages(page.id, content, file);
-                    result.pushed.push(file.path);
+                // Force push: reconcile with Confluence first.
+                // Pull remote content and compare — if they differ, insert
+                // conflict markers so the user can resolve before pushing.
+                const record = this.state.get(file.path);
+                let pageId: string | undefined;
+                if (record) {
+                    pageId = record.confluencePageId;
                 } else {
-                    console.log(`[ConfluenceSync] Force push: no record, creating new page`);
-                    const pushed = await this.pushFile(file, result, false);
-                    if (pushed) result.pushed.push(file.path);
+                    const existing = await this.client.getPageByTitle(file.basename);
+                    if (existing) pageId = existing.id;
                 }
+
+                if (pageId) {
+                    // Remote page exists — check if it changed since our last sync
+                    const remotePage = await this.client.getPage(pageId);
+
+                    // If the remote version matches what we last synced with,
+                    // there are no remote changes to reconcile — just push.
+                    const remoteChanged = !record || record.confluenceVersion < remotePage.version;
+
+                    if (remoteChanged) {
+                        // Remote was edited since our last sync — show both
+                        // versions so the user can reconcile before pushing.
+                        const remoteMarkdown = confluenceStorageToMarkdown(remotePage.body);
+
+                        let commentsSection = "";
+                        try {
+                            const comments = await this.client.getPageComments(pageId);
+                            if (comments.length > 0) {
+                                commentsSection = formatCommentsAsMarkdown(comments, remotePage.body, remoteMarkdown);
+                            }
+                        } catch (e) {
+                            console.warn(`[ConfluenceSync] Failed to fetch comments for force push reconcile:`, e);
+                        }
+
+                        const localRaw = await this.vault.read(file);
+                        const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
+                        const localContent = (markerIdx !== -1
+                            ? localRaw.substring(0, markerIdx)
+                            : localRaw
+                        ).trimEnd();
+                        const remoteContent = remoteMarkdown.trimEnd();
+
+                        const finalContent = [
+                            "<<<<<<< LOCAL",
+                            localContent,
+                            "=======",
+                            remoteContent,
+                            ">>>>>>> CONFLUENCE",
+                            commentsSection,
+                        ].join("\n");
+                        await this.vault.modify(file, finalContent);
+
+                        // Store the remote version so the next force push
+                        // knows we've already shown this diff to the user.
+                        this.state.set(file.path, {
+                            confluencePageId: remotePage.id,
+                            confluenceTitle: remotePage.title,
+                            confluenceVersion: remotePage.version,
+                            confluenceParentId: remotePage.parentId,
+                            lastSyncedAt: new Date().toISOString(),
+                            contentHash: record?.contentHash ?? "",
+                        });
+
+                        result.conflicts.push(file.path);
+                        console.log(`[ConfluenceSync] Force push "${file.path}": remote v${remotePage.version} > synced v${record?.confluenceVersion} — conflict markers inserted, push aborted`);
+                        await this.state.save();
+                        return result;
+                    }
+                    console.log(`[ConfluenceSync] Force push "${file.path}": remote v${remotePage.version} matches synced version — proceeding with push`);
+                }
+
+                // Content matches (or no remote page yet) — proceed with force push
+                const pushed = await this.pushFile(file, result, true);
+                if (pushed) result.pushed.push(file.path);
             } else {
                 const pushed = await this.pushFile(file, result, false);
                 if (pushed) result.pushed.push(file.path);
@@ -578,6 +666,112 @@ export class SyncEngine {
             console.error(`[ConfluenceSync] Force push error:`, e);
             result.errors.push({ path: file.path, error: String(e) });
         }
+        await this.state.save();
+        return result;
+    }
+
+    /**
+     * Pull a single file from Confluence with reconciliation.
+     * - If local and remote content are identical, just refresh comments + state.
+     * - If they differ, insert git-style conflict markers so the user can
+     *   review both versions and manually resolve.
+     * - Comments are always appended (they're read-only / stripped on push).
+     */
+    async pullFileDirect(file: TFile): Promise<SyncResult> {
+        this._foundFolderCache.clear();
+        const result: SyncResult = { pushed: [], pulled: [], deleted: [], conflicts: [], errors: [] };
+
+        try {
+            const record = this.state.get(file.path);
+            let pageId: string | undefined;
+
+            if (record) {
+                pageId = record.confluencePageId;
+            } else {
+                // No sync record — try to find by title
+                const title = file.basename;
+                const existing = await this.client.getPageByTitle(title);
+                if (existing) {
+                    pageId = existing.id;
+                }
+            }
+
+            if (!pageId) {
+                result.errors.push({ path: file.path, error: "No Confluence page found for this file" });
+                await this.state.save();
+                return result;
+            }
+
+            const remotePage = await this.client.getPage(pageId);
+            const remoteMarkdown = confluenceStorageToMarkdown(remotePage.body);
+
+            // Fetch comments
+            let commentsSection = "";
+            try {
+                const comments = await this.client.getPageComments(pageId);
+                if (comments.length > 0) {
+                    commentsSection = formatCommentsAsMarkdown(comments, remotePage.body, remoteMarkdown);
+                }
+            } catch (e) {
+                console.warn(`[ConfluenceSync] Failed to fetch comments for pull:`, e);
+            }
+
+            // Read local content, stripping the comments section
+            const localRaw = await this.vault.read(file);
+            const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
+            const localContent = (markerIdx !== -1
+                ? localRaw.substring(0, markerIdx)
+                : localRaw
+            ).trimEnd();
+
+            // Check if remote changed since our last sync (version-based).
+            // Content comparison is unreliable due to Confluence HTML normalization.
+            const remoteChanged = !record || record.confluenceVersion < remotePage.version;
+
+            let finalContent: string;
+
+            if (!remoteChanged) {
+                // Remote hasn't changed — just refresh comments
+                finalContent = localContent + commentsSection;
+                console.log(`[ConfluenceSync] Force pull "${file.path}": remote v${remotePage.version} matches synced version, refreshing comments`);
+            } else {
+                // Remote was edited — insert conflict markers for the user to resolve
+                const remoteContent = remoteMarkdown.trimEnd();
+                finalContent = [
+                    "<<<<<<< LOCAL",
+                    localContent,
+                    "=======",
+                    remoteContent,
+                    ">>>>>>> CONFLUENCE",
+                    commentsSection,
+                ].join("\n");
+                result.conflicts.push(file.path);
+                console.log(`[ConfluenceSync] Force pull "${file.path}": remote v${remotePage.version} > synced v${record?.confluenceVersion} — conflict markers inserted`);
+            }
+
+            await this.vault.modify(file, finalContent);
+
+            // Update state to reflect the remote version we fetched. The user
+            // still needs to resolve conflicts and push, but recording the
+            // version prevents the next auto-sync from re-pulling the same diff.
+            const roundTripStorage = markdownToConfluenceStorage(finalContent);
+            const stableHash = SyncStateManager.hash(roundTripStorage);
+
+            this.state.set(file.path, {
+                confluencePageId: remotePage.id,
+                confluenceTitle: remotePage.title,
+                confluenceVersion: remotePage.version,
+                confluenceParentId: remotePage.parentId,
+                lastSyncedAt: new Date().toISOString(),
+                contentHash: stableHash,
+            });
+
+            result.pulled.push(file.path);
+        } catch (e) {
+            console.error(`[ConfluenceSync] Force pull error:`, e);
+            result.errors.push({ path: file.path, error: String(e) });
+        }
+
         await this.state.save();
         return result;
     }
@@ -605,46 +799,83 @@ export class SyncEngine {
 
         if (localPath) {
             const record = this.state.get(localPath)!;
-
-            // No remote change
-            if (record.contentHash === remoteHash) return false;
-
             const file = this.vault.getAbstractFileByPath(localPath);
 
-            if (file instanceof TFile) {
-                const localContent = await this.vault.read(file);
-                const localStorageHash = SyncStateManager.hash(markdownToConfluenceStorage(localContent));
-                const localChanged = localStorageHash !== record.contentHash;
+            // Check whether the page content has changed (version bump)
+            const contentChanged = record.confluenceVersion < page.version;
 
-                if (localChanged) {
-                    // Conflict – already recorded during push phase; honour strategy
-                    const strategy = this.settings.conflictStrategy;
-                    if (strategy === "local") return false;
-                    if (strategy === "newer") {
-                        const localMtime = file.stat.mtime;
-                        const remoteMtime = new Date(page.updatedAt).getTime();
-                        if (localMtime > remoteMtime) return false;
+            // Always refresh comments — new comments don't bump the page version
+            let commentsSection = "";
+            try {
+                const comments = await this.client.getPageComments(page.id);
+                if (comments.length > 0) {
+                    const markdown = confluenceStorageToMarkdown(page.body);
+                    commentsSection = formatCommentsAsMarkdown(comments, page.body, markdown);
+                }
+            } catch (e) {
+                console.warn(`[ConfluenceSync] Failed to fetch comments for "${page.title}":`, e);
+            }
+
+            if (contentChanged) {
+                // Content changed — check for conflicts before overwriting
+                if (file instanceof TFile) {
+                    const localContent = await this.vault.read(file);
+                    const localStorageHash = SyncStateManager.hash(markdownToConfluenceStorage(localContent));
+                    const localChanged = localStorageHash !== record.contentHash;
+
+                    if (localChanged) {
+                        // Conflict – already recorded during push phase; honour strategy
+                        const strategy = this.settings.conflictStrategy;
+                        if (strategy === "local") return false;
+                        if (strategy === "newer") {
+                            const localMtime = file.stat.mtime;
+                            const remoteMtime = new Date(page.updatedAt).getTime();
+                            if (localMtime > remoteMtime) return false;
+                        }
                     }
+                }
+
+                const markdown = confluenceStorageToMarkdown(page.body) + commentsSection;
+                if (file instanceof TFile) {
+                    await this.vault.modify(file, markdown);
+                } else {
+                    const targetPath = this.buildLocalPathFromAncestors(page.title, ancestorIds, ancestorTitles);
+                    await this.ensureFolder(targetPath);
+                    await this.vault.create(targetPath, markdown);
+                }
+
+                const roundTripStorage = markdownToConfluenceStorage(markdown);
+                const stableHash = SyncStateManager.hash(roundTripStorage);
+
+                this.state.set(localPath, {
+                    ...record,
+                    confluenceParentId: page.parentId,
+                    confluenceVersion: page.version,
+                    lastSyncedAt: new Date().toISOString(),
+                    contentHash: stableHash,
+                });
+                return true;
+            }
+
+            // Content unchanged — refresh just the comments section if it differs
+            if (commentsSection && file instanceof TFile) {
+                const localContent = await this.vault.read(file);
+                const markerIdx = localContent.indexOf(COMMENTS_SECTION_MARKER);
+                const existingComments = markerIdx !== -1
+                    ? localContent.substring(markerIdx - 1)  // include preceding newline
+                    : "";
+                const newComments = commentsSection;
+
+                if (existingComments.trimEnd() !== newComments.trimEnd()) {
+                    const contentWithoutComments = markerIdx !== -1
+                        ? localContent.substring(0, markerIdx).trimEnd()
+                        : localContent.trimEnd();
+                    await this.vault.modify(file, contentWithoutComments + newComments);
+                    return true;
                 }
             }
 
-            const markdown = confluenceStorageToMarkdown(page.body);
-            if (file instanceof TFile) {
-                await this.vault.modify(file, markdown);
-            } else {
-                const targetPath = this.buildLocalPathFromAncestors(page.title, ancestorIds, ancestorTitles);
-                await this.ensureFolder(targetPath);
-                await this.vault.create(targetPath, markdown);
-            }
-
-            this.state.set(localPath, {
-                ...record,
-                confluenceParentId: page.parentId,
-                confluenceVersion: page.version,
-                lastSyncedAt: new Date().toISOString(),
-                contentHash: remoteHash,
-            });
-            return true;
+            return false;
         }
 
         // Remote page has no local counterpart — skip. Local vault is the
@@ -1013,6 +1244,46 @@ export class SyncEngine {
                         `[ConfluenceSync] Stale folder parent ID ${currentParentId} evicted — will retry`
                     );
                     throw new StaleFolderError(segment, currentParentId);
+                }
+                // Title collision — a page with this name already exists in
+                // the space under a different parent. Confluence enforces
+                // space-wide unique titles, so try to create a disambiguated
+                // title using the parent page's title (e.g. "Parent/artifacts").
+                // If that fails, fall back to linking the existing page.
+                if (String(e).includes("already exists")) {
+                    try {
+                        // Attempt to fetch the parent page title to build a
+                        // disambiguated folder title.
+                        const parentPage = currentParentId ? await this.client.getPage(currentParentId).catch(() => null) : null;
+                        const parentTitle = parentPage ? parentPage.title : null;
+                        const disambigTitle = parentTitle ? `${parentTitle}/${segment}` : `${segment}`;
+
+                        // Try creating the folder page with the disambiguated title.
+                        const newFolder = await this.client.createPage(disambigTitle, "<p></p>", currentParentId);
+                        this.state.setFolder(accumulatedPath, newFolder.id);
+                        currentParentId = newFolder.id;
+                        console.warn(
+                            `[ConfluenceSync] Created disambiguated folder page "${disambigTitle}" (${newFolder.id}) for local dir ${accumulatedPath}`
+                        );
+                        continue;
+                    } catch (e2: any) {
+                        // If disambiguated create also fails, fall back to the
+                        // existing page (if any) so we don't block the push.
+                        const fallback = await this.client.getPageByTitle(segment);
+                        if (fallback) {
+                            console.warn(
+                                `[ConfluenceSync] Folder page "${segment}" already exists; falling back to existing page ${fallback.id}`
+                            );
+                            const localDirExists = !!this.vault.getAbstractFileByPath(accumulatedPath);
+                            if (localDirExists) {
+                                this.state.setFolder(accumulatedPath, fallback.id);
+                            } else {
+                                this._foundFolderCache.set(accumulatedPath, fallback.id);
+                            }
+                            currentParentId = fallback.id;
+                            continue;
+                        }
+                    }
                 }
                 throw e;
             }
