@@ -65,6 +65,7 @@ Right-click any file or folder inside your sync directory in the file explorer a
 | **Confluence Sync: Pull from Confluence**                     | Pull content updates for already-tracked pages from Confluence                 |
 | **Confluence Sync: Push current file to Confluence**          | Push only the active editor's file                                             |
 | **Confluence Sync: Force push current file to Confluence**    | Push the active file ignoring hash cache (useful after converter changes)      |
+| **Confluence Sync: Force pull current file**                  | Pull the active file from Confluence, overwriting local content                |
 | **Confluence Sync: Reset sync state**                         | Clear all file↔page mappings and folder mappings (does not delete remote data) |
 | **Confluence Sync: Delete unmanaged local files**             | Remove local files in the sync directory that are not tracked by the plugin    |
 
@@ -117,10 +118,12 @@ The converter (`src/converter.ts`) handles:
 - Headings, bold, italic, strikethrough, inline code
 - Fenced code blocks ↔ Confluence `code` macro
 - Ordered and unordered lists (nested)
+- Task lists (`- [ ]` / `- [x]`) ↔ Confluence task macros
 - Tables (GFM ↔ Confluence `<table>`)
 - Links and images (including `![[image.png]]` → attachment macro)
 - Horizontal rules and blockquotes
 - Obsidian-specific syntax: `[[wiki links]]` (resolved to Confluence URLs), embeds (`![[...]]`), highlights (`==...==`), footnotes, callouts (`> [!NOTE]`), tags, Waypoint markers (`%% ... %%`)
+- Confluence inline comments — preserved across pushes and displayed in a comments section at the bottom of local files
 - YAML frontmatter removal
 - XML special-character escaping
 - Optional `titleToUrl` map and `contextDir` for context-aware wiki link → URL resolution
@@ -166,6 +169,6 @@ tests/
 - Sync state is stored in `data.json` under the keys `syncMap` (file records) and `folderMap` (folder page IDs).
 - To start fresh: delete the synced pages in Confluence, run **Reset sync state**, then **Sync all**.
 
-## Known Bugs
+## Known Issues
 
-- **Image attachment 409 on re-push** — Re-uploading an image that already exists as a page attachment may occasionally produce a 409 error. Sync continues and no content is lost; the previously-uploaded attachment remains intact.
+- **Callout rendering** — Obsidian callouts (`> [!NOTE]`, `> [!WARNING]`, etc.) are converted to Confluence structured macros, but may not render as styled callout boxes in all Confluence themes. Content is preserved correctly.
