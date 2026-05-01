@@ -321,7 +321,7 @@ export class ConfluenceClient {
     async getAttachmentId(pageId: string, filename: string): Promise<string | null> {
         try {
             const data = await this.request<{ results: Array<{ id: string; title: string }> }>(
-                `/rest/api/content/${pageId}/child/attachment?filename=${encodeURIComponent(filename)}&limit=1`
+                `/content/${pageId}/child/attachment?filename=${encodeURIComponent(filename)}&limit=1`
             );
             return data.results?.[0]?.id ?? null;
         } catch {

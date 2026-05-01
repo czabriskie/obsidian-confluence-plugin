@@ -4,7 +4,7 @@
     "version": "1.0.0",
     "minAppVersion": "0.15.0",
     "description": "Two-way sync between Obsidian vault directories and Confluence spaces",
-    "author": "Your Name",
-    "authorUrl": "",
+    "author": "Cameron Zabriskie",
+    "authorUrl": "https://github.com/czabriskie",
     "isDesktopOnly": true
 }
