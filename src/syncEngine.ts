@@ -69,6 +69,32 @@ export class SyncEngine {
     ) { }
 
     /**
+     * Strip git-style conflict markers from content, keeping only the LOCAL
+     * portion.  Prevents nested markers when re-inserting conflict blocks on
+     * a file that already contains unresolved markers.
+     */
+    private static stripConflictMarkers(content: string): string {
+        const startTag = "<<<<<<< LOCAL\n";
+        const separator = "\n=======\n";
+        const endTag = "\n>>>>>>> CONFLUENCE";
+
+        const startIdx = content.indexOf(startTag);
+        if (startIdx === -1) return content;
+
+        const sepIdx = content.indexOf(separator, startIdx);
+        if (sepIdx === -1) return content;
+
+        const endIdx = content.indexOf(endTag, sepIdx);
+        if (endIdx === -1) return content;
+
+        const before = content.substring(0, startIdx);
+        const localPortion = content.substring(startIdx + startTag.length, sepIdx);
+        const after = content.substring(endIdx + endTag.length);
+
+        return before + localPortion + after;
+    }
+
+    /**
      * Build a map of page title (lowercased) → Confluence page URL from the
      * current sync state. Used to resolve [[wiki links]] in markdown.
      */
@@ -620,10 +646,12 @@ export class SyncEngine {
 
                         const localRaw = await this.vault.read(file);
                         const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
-                        const localContent = (markerIdx !== -1
-                            ? localRaw.substring(0, markerIdx)
-                            : localRaw
-                        ).trimEnd();
+                        const localContent = SyncEngine.stripConflictMarkers(
+                            (markerIdx !== -1
+                                ? localRaw.substring(0, markerIdx)
+                                : localRaw
+                            ).trimEnd()
+                        );
                         const remoteContent = remoteMarkdown.trimEnd();
 
                         const finalContent = [
@@ -636,15 +664,16 @@ export class SyncEngine {
                         ].join("\n");
                         await this.vault.modify(file, finalContent);
 
-                        // Store the remote version so the next force push
-                        // knows we've already shown this diff to the user.
+                        // Store the remote version and the hash of the actual
+                        // remote body so that after the user resolves markers
+                        // and pushes, the remote isn't seen as "changed".
                         this.state.set(file.path, {
                             confluencePageId: remotePage.id,
                             confluenceTitle: remotePage.title,
                             confluenceVersion: remotePage.version,
                             confluenceParentId: remotePage.parentId,
                             lastSyncedAt: new Date().toISOString(),
-                            contentHash: record?.contentHash ?? "",
+                            contentHash: SyncStateManager.hash(remotePage.body),
                         });
 
                         result.conflicts.push(file.path);
@@ -716,13 +745,16 @@ export class SyncEngine {
                 console.warn(`[ConfluenceSync] Failed to fetch comments for pull:`, e);
             }
 
-            // Read local content, stripping the comments section
+            // Read local content, stripping the comments section and any
+            // existing conflict markers (to prevent nested markers).
             const localRaw = await this.vault.read(file);
             const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
-            const localContent = (markerIdx !== -1
-                ? localRaw.substring(0, markerIdx)
-                : localRaw
-            ).trimEnd();
+            const localContent = SyncEngine.stripConflictMarkers(
+                (markerIdx !== -1
+                    ? localRaw.substring(0, markerIdx)
+                    : localRaw
+                ).trimEnd()
+            );
 
             // Check if remote changed since our last sync (version-based).
             // Content comparison is unreliable due to Confluence HTML normalization.
@@ -754,8 +786,11 @@ export class SyncEngine {
             // Update state to reflect the remote version we fetched. The user
             // still needs to resolve conflicts and push, but recording the
             // version prevents the next auto-sync from re-pulling the same diff.
-            const roundTripStorage = markdownToConfluenceStorage(finalContent);
-            const stableHash = SyncStateManager.hash(roundTripStorage);
+            // In the conflict case, store the hash of the actual remote body so
+            // that after resolving markers the remote isn't seen as "changed".
+            const stableHash = remoteChanged
+                ? SyncStateManager.hash(remotePage.body)
+                : SyncStateManager.hash(markdownToConfluenceStorage(finalContent));
 
             this.state.set(file.path, {
                 confluencePageId: remotePage.id,
