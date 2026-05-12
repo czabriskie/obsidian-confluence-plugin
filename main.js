@@ -743,11 +743,11 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
   html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
   html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
   html = html.replace(
-    /^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm,
-    (_, langLine, code) => {
+    /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+    (_, prefix, langLine, code) => {
       var _a;
       const lang = (_a = langLine.trim().split(/\s+/)[0]) != null ? _a : "";
-      return `<ac:structured-macro ac:name="code">` + (lang ? `<ac:parameter ac:name="language">${escapeXmlText(lang)}</ac:parameter>` : "") + `<ac:plain-text-body><![CDATA[${code}]]></ac:plain-text-body></ac:structured-macro>`;
+      return (prefix.trim() ? escapeXmlText(prefix.trim()) + "\n" : "") + `<ac:structured-macro ac:name="code">` + (lang ? `<ac:parameter ac:name="language">${escapeXmlText(lang)}</ac:parameter>` : "") + `<ac:plain-text-body><![CDATA[${code}]]></ac:plain-text-body></ac:structured-macro>`;
     }
   );
   html = applyOutsideCdata(html, convertTables);
@@ -1174,7 +1174,7 @@ var StaleFolderError = class extends Error {
     this.name = "StaleFolderError";
   }
 };
-var SyncEngine = class {
+var SyncEngine = class _SyncEngine {
   constructor(vault, client, state, settings) {
     this.vault = vault;
     this.client = client;
@@ -1195,6 +1195,26 @@ var SyncEngine = class {
      * Local filenames are never affected — only the Confluence page title.
      */
     __publicField(this, "_ambiguousBasenames", /* @__PURE__ */ new Set());
+  }
+  /**
+   * Strip git-style conflict markers from content, keeping only the LOCAL
+   * portion.  Prevents nested markers when re-inserting conflict blocks on
+   * a file that already contains unresolved markers.
+   */
+  static stripConflictMarkers(content) {
+    const startTag = "<<<<<<< LOCAL\n";
+    const separator = "\n=======\n";
+    const endTag = "\n>>>>>>> CONFLUENCE";
+    const startIdx = content.indexOf(startTag);
+    if (startIdx === -1) return content;
+    const sepIdx = content.indexOf(separator, startIdx);
+    if (sepIdx === -1) return content;
+    const endIdx = content.indexOf(endTag, sepIdx);
+    if (endIdx === -1) return content;
+    const before = content.substring(0, startIdx);
+    const localPortion = content.substring(startIdx + startTag.length, sepIdx);
+    const after = content.substring(endIdx + endTag.length);
+    return before + localPortion + after;
   }
   /**
    * Build a map of page title (lowercased) → Confluence page URL from the
@@ -1584,7 +1604,6 @@ var SyncEngine = class {
    * Useful when the converter has been fixed and the stored hash is stale.
    */
   async pushFileDirect(file, force = false) {
-    var _a;
     this._foundFolderCache.clear();
     this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
     const result = { pushed: [], pulled: [], deleted: [], conflicts: [], errors: [] };
@@ -1614,7 +1633,9 @@ var SyncEngine = class {
             }
             const localRaw = await this.vault.read(file);
             const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
-            const localContent = (markerIdx !== -1 ? localRaw.substring(0, markerIdx) : localRaw).trimEnd();
+            const localContent = _SyncEngine.stripConflictMarkers(
+              (markerIdx !== -1 ? localRaw.substring(0, markerIdx) : localRaw).trimEnd()
+            );
             const remoteContent = remoteMarkdown.trimEnd();
             const finalContent = [
               "<<<<<<< LOCAL",
@@ -1631,7 +1652,7 @@ var SyncEngine = class {
               confluenceVersion: remotePage.version,
               confluenceParentId: remotePage.parentId,
               lastSyncedAt: (/* @__PURE__ */ new Date()).toISOString(),
-              contentHash: (_a = record == null ? void 0 : record.contentHash) != null ? _a : ""
+              contentHash: SyncStateManager.hash(remotePage.body)
             });
             result.conflicts.push(file.path);
             console.log(`[ConfluenceSync] Force push "${file.path}": remote v${remotePage.version} > synced v${record == null ? void 0 : record.confluenceVersion} \u2014 conflict markers inserted, push aborted`);
@@ -1693,7 +1714,9 @@ var SyncEngine = class {
       }
       const localRaw = await this.vault.read(file);
       const markerIdx = localRaw.indexOf(COMMENTS_SECTION_MARKER);
-      const localContent = (markerIdx !== -1 ? localRaw.substring(0, markerIdx) : localRaw).trimEnd();
+      const localContent = _SyncEngine.stripConflictMarkers(
+        (markerIdx !== -1 ? localRaw.substring(0, markerIdx) : localRaw).trimEnd()
+      );
       const remoteChanged = !record || record.confluenceVersion < remotePage.version;
       let finalContent;
       if (!remoteChanged) {
@@ -1713,8 +1736,7 @@ var SyncEngine = class {
         console.log(`[ConfluenceSync] Force pull "${file.path}": remote v${remotePage.version} > synced v${record == null ? void 0 : record.confluenceVersion} \u2014 conflict markers inserted`);
       }
       await this.vault.modify(file, finalContent);
-      const roundTripStorage = markdownToConfluenceStorage(finalContent);
-      const stableHash = SyncStateManager.hash(roundTripStorage);
+      const stableHash = remoteChanged ? SyncStateManager.hash(remotePage.body) : SyncStateManager.hash(markdownToConfluenceStorage(finalContent));
       this.state.set(file.path, {
         confluencePageId: remotePage.id,
         confluenceTitle: remotePage.title,

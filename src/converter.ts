@@ -400,12 +400,16 @@ export function markdownToConfluenceStorage(
     //   - a multi-word string like "aws s3api ..." (when the user types the
     //     command inline after the fence) → treat the whole first line as the
     //     language hint but only store the first word as the language param.
+    // The opening ``` may appear mid-line (e.g. in a list item like
+    // "- CSP errors ```\n...```"), so we allow optional leading text before
+    // the opening fence. The leading text is preserved before the macro.
     html = html.replace(
-        /^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm,
-        (_, langLine, code) => {
+        /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+        (_, prefix, langLine, code) => {
             // Use only the first whitespace-delimited token as the language identifier
             const lang = langLine.trim().split(/\s+/)[0] ?? "";
             return (
+                (prefix.trim() ? escapeXmlText(prefix.trim()) + "\n" : "") +
                 `<ac:structured-macro ac:name="code">` +
                 (lang ? `<ac:parameter ac:name="language">${escapeXmlText(lang)}</ac:parameter>` : "") +
                 `<ac:plain-text-body><![CDATA[${code}]]></ac:plain-text-body>` +

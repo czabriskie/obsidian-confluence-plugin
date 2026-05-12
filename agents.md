@@ -113,7 +113,8 @@ Key transformations (in order):
    - Falls back to plain text if not in map
 6. Headings
 7. Code fences → `<ac:structured-macro ac:name="code">` with CDATA
-   - Regex: `/^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm` (captures full first line, uses first token as language)
+   - Regex allows optional leading text before ` ``` ` so mid-line fences (e.g. `- item ```\n...\n````) are captured
+   - Captures full first line after ` ``` `, uses first token as language
 8. **Tables** (`convertTables`) — runs here, before inline passes, so pipe chars and backtick/bold cell content aren't pre-converted
    - Header row → `<thead><tr><th>` cells; separator row (`|---|`) skipped; data rows → `<tbody><tr><td>`
    - Backtick-wrapped cell values have backticks stripped (rendered as plain text)
@@ -240,8 +241,8 @@ Settings tab includes a **Test Connection** button that calls `client.getSpace()
 
 | File | Count | What's covered |
 |---|---|---|
-| `converter.test.ts` | ~30 | Push/pull conversion, code blocks, images, round-trips |
-| `syncStateManager.test.ts` | ~14 | CRUD, persistence, hash |
+| `converter.test.ts` | ~87 | Push/pull conversion, code blocks, images, round-trips |
+| `syncStateManager.test.ts` | ~15 | CRUD, persistence, hash |
 
 Run with `npm test` (vitest).
 
@@ -272,6 +273,8 @@ Run with `npm test` (vitest).
 11. **`contextDir` for wiki link resolution** — `markdownToConfluenceStorage()` accepts an optional `contextDir` (the file's immediate parent folder name, lowercased). This is used to prefer sibling-directory disambiguation matches: `[[Learning]]` inside `Daily Notes/` resolves to `"daily notes/learning"` before falling back to the global `"learning"`. Use `file.parent?.name.toLowerCase()` — do NOT use the full sync-root-relative path.
 
 12. **Pull is content-only** — `pullPage()` only updates files that already exist in the local sync state. It never creates new local files from Confluence pages. The local vault is the authoritative source for file structure.
+
+13. **Conflict markers & `stripConflictMarkers()`** — `pushFileDirect` and `pullFileDirect` insert `<<<<<<< LOCAL` / `>>>>>>> CONFLUENCE` markers when remote content differs. After inserting markers, `contentHash` is stored as `hash(remotePage.body)` (not the marked-up content) so the next sync doesn't see a false diff. `stripConflictMarkers()` extracts only the LOCAL portion before re-inserting markers, preventing nested/accumulated conflict blocks.
 
 ## Known Bugs
 

@@ -45,6 +45,14 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("print('hi')");
     });
 
+    it("converts mid-line code fences (e.g. in list items)", () => {
+        const md = "- CSP errors ```\nhomepage:5 script-src 'self'\n```";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain('ac:name="code"');
+        expect(result).toContain("<![CDATA[");
+        expect(result).toContain("homepage:5 script-src 'self'");
+    });
+
     it("converts unordered lists", () => {
         const md = "- one\n- two\n- three";
         const result = markdownToConfluenceStorage(md);
