@@ -243,6 +243,13 @@ export class SyncEngine {
 
     // ── Local → Remote ────────────────────────────────────────────────────
 
+    /** Strip auto-generated comments section from content (appended after every push). */
+    private static stripCommentsSection(content: string): string {
+        const markerIdx = content.indexOf(COMMENTS_SECTION_MARKER);
+        if (markerIdx === -1) return content;
+        return content.substring(0, markerIdx).trimEnd();
+    }
+
     private async pushFile(
         file: TFile,
         result: SyncResult,
@@ -442,7 +449,10 @@ export class SyncEngine {
             return true;
         }
         // against the stored hash (which is always a storage-body hash).
-        const storageBodyForCheck = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
+        // Strip comments section before hashing for comparison, since comments
+        // are appended after every sync with updated timestamps.
+        const contentForHash = SyncEngine.stripCommentsSection(content);
+        const storageBodyForCheck = markdownToConfluenceStorage(contentForHash, this.buildTitleToUrl(), this.contextDirForFile(file));
         const storageHash = SyncStateManager.hash(storageBodyForCheck);
         const localChanged = storageHash !== record.contentHash;
 
@@ -854,7 +864,8 @@ export class SyncEngine {
             if (contentChanged) {
                 // Content changed — check for conflicts before overwriting
                 if (file instanceof TFile) {
-                    const localContent = await this.vault.read(file);
+                    const localRaw = await this.vault.read(file);
+                    const localContent = SyncEngine.stripCommentsSection(localRaw);
                     const localStorageHash = SyncStateManager.hash(markdownToConfluenceStorage(localContent));
                     const localChanged = localStorageHash !== record.contentHash;
 

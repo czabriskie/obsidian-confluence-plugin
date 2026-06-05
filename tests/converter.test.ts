@@ -22,7 +22,7 @@ describe("markdownToConfluenceStorage", () => {
     });
 
     it("converts strikethrough", () => {
-        expect(markdownToConfluenceStorage("~~gone~~")).toContain("<del>gone</del>");
+        expect(markdownToConfluenceStorage("~~gone~~")).toContain('<span style="text-decoration: line-through;">gone</span>');
     });
 
     it("converts inline code", () => {
@@ -92,15 +92,15 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain("<ac:task-list>");
         expect(result).toContain("<ac:task-id>");
         expect(result).toContain("<ac:task-status>incomplete</ac:task-status>");
-        expect(result).toContain('<span class="placeholder-inline-tasks">Buy groceries</span>');
-        expect(result).toContain('<span class="placeholder-inline-tasks">Walk the dog</span>');
+        expect(result).toContain('<ac:task-body>Buy groceries</ac:task-body>');
+        expect(result).toContain('<ac:task-body>Walk the dog</ac:task-body>');
     });
 
     it("converts checked checkbox to complete task", () => {
         const md = "- [x] Done item";
         const result = markdownToConfluenceStorage(md);
         expect(result).toContain("<ac:task-status>complete</ac:task-status>");
-        expect(result).toContain('<span class="placeholder-inline-tasks">Done item</span>');
+        expect(result).toContain('<ac:task-body>Done item</ac:task-body>');
     });
 
     it("converts mixed checkboxes", () => {
@@ -238,10 +238,11 @@ describe("markdownToConfluenceStorage", () => {
         const md = "| Key | Value |\n|---|---|\n| foo | bar |";
         const result = markdownToConfluenceStorage(md);
         expect(result).toContain("<table>");
-        expect(result).toContain("<thead>");
         expect(result).toContain("<th><p>Key</p></th>");
         expect(result).toContain("<th><p>Value</p></th>");
         expect(result).toContain("<tbody>");
+        expect(result).not.toContain("<thead>");
+        expect(result).not.toContain("<colgroup>");
         expect(result).toContain("<td><p>foo</p></td>");
         expect(result).toContain("<td><p>bar</p></td>");
     });
@@ -396,6 +397,7 @@ describe("confluenceStorageToMarkdown", () => {
 
     it("converts strikethrough", () => {
         expect(confluenceStorageToMarkdown("<del>gone</del>")).toContain("~~gone~~");
+        expect(confluenceStorageToMarkdown('<span style="text-decoration: line-through;">gone</span>')).toContain("~~gone~~");
     });
 
     it("converts inline code", () => {
@@ -476,7 +478,7 @@ describe("confluenceStorageToMarkdown", () => {
     });
 
     it("converts task list to checkboxes", () => {
-        const storage = '<ac:task-list><ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">Buy milk</span></ac:task-body></ac:task><ac:task><ac:task-id>2</ac:task-id><ac:task-status>complete</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">Walk dog</span></ac:task-body></ac:task></ac:task-list>';
+        const storage = '<ac:task-list><ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Buy milk</ac:task-body></ac:task><ac:task><ac:task-id>2</ac:task-id><ac:task-status>complete</ac:task-status><ac:task-body>Walk dog</ac:task-body></ac:task></ac:task-list>';
         const result = confluenceStorageToMarkdown(storage);
         expect(result).toContain("- [ ] Buy milk");
         expect(result).toContain("- [x] Walk dog");

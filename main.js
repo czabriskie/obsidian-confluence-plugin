@@ -563,20 +563,14 @@ function convertTables(input) {
       const sepIdx = rows.findIndex(isSeparator);
       const headerRows = sepIdx > 0 ? rows.slice(0, sepIdx) : [rows[0]];
       const dataRows = sepIdx >= 0 ? rows.slice(sepIdx + 1) : rows.slice(1);
-      let out = `<table><colgroup>${headerRows[0].split("|").slice(1, -1).map(() => "<col/>").join("")}</colgroup>`;
-      out += "<thead>";
+      let out = "<table><tbody>";
       for (const row of headerRows) {
         out += "<tr>" + parseCells(row).map((c) => `<th><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></th>`).join("") + "</tr>";
       }
-      out += "</thead>";
-      if (dataRows.length > 0) {
-        out += "<tbody>";
-        for (const row of dataRows) {
-          out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></td>`).join("") + "</tr>";
-        }
-        out += "</tbody>";
+      for (const row of dataRows) {
+        out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></td>`).join("") + "</tr>";
       }
-      out += "</table>";
+      out += "</tbody></table>";
       return out;
     }
   );
@@ -594,7 +588,7 @@ function convertTaskLists(input) {
         const status = checked ? "complete" : "incomplete";
         const text = escapeXmlTextNodes(m[2]);
         const id = taskIdCounter++;
-        return `<ac:task><ac:task-id>${id}</ac:task-id><ac:task-status>${status}</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">${text}</span></ac:task-body></ac:task>`;
+        return `<ac:task><ac:task-id>${id}</ac:task-id><ac:task-status>${status}</ac:task-status><ac:task-body>${text}</ac:task-body></ac:task>`;
       });
       return `<ac:task-list>${tasks.join("")}</ac:task-list>`;
     }
@@ -686,8 +680,8 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
       }
       if (body) {
         body = body.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/\*(.+?)\*/g, "<em>$1</em>").replace(/`(.+?)`/g, "<code>$1</code>").replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-        macro += `<ac:rich-text-body><p>${escapeXmlTextNodes(body)}</p></ac:rich-text-body>`;
       }
+      macro += `<ac:rich-text-body><p>${body ? escapeXmlTextNodes(body) : ""}</p></ac:rich-text-body>`;
       macro += `</ac:structured-macro>`;
       return macro;
     }
@@ -743,7 +737,7 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
   html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
   html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
   html = html.replace(
-    /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+    /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
     (_, prefix, langLine, code) => {
       var _a;
       const lang = (_a = langLine.trim().split(/\s+/)[0]) != null ? _a : "";
@@ -751,13 +745,16 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
     }
   );
   html = applyOutsideCdata(html, convertTables);
+  html = html.replace(/`{2,}([^`]*)`{2,}/g, (_, code) => {
+    return `<code>${escapeXmlText(code)}</code>`;
+  });
   html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
   html = applyOutsideCdata(html, (segment) => {
     segment = segment.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
     segment = segment.replace(/__(.+?)__/g, "<strong>$1</strong>");
     segment = segment.replace(/\*(.+?)\*/g, "<em>$1</em>");
     segment = segment.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
-    segment = segment.replace(/~~(.+?)~~/g, "<del>$1</del>");
+    segment = segment.replace(/~~(.+?)~~/g, '<span style="text-decoration: line-through;">$1</span>');
     return segment;
   });
   html = html.replace(/^(?:---|\*\*\*|___)\s*$/gm, "<hr/>");
@@ -869,6 +866,7 @@ function inlineHtmlToMd(text) {
   text = text.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
   text = text.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
   text = text.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
+  text = text.replace(/<span[^>]*style="[^"]*text-decoration:\s*line-through[^"]*"[^>]*>([\s\S]*?)<\/span>/gi, "~~$1~~");
   text = text.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
   text = text.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
   text = text.replace(/<br\s*\/?>/gi, " ");
@@ -1049,6 +1047,7 @@ function confluenceStorageToMarkdown(storage) {
   md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
   md = md.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
   md = md.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
+  md = md.replace(/<span[^>]*style="[^"]*text-decoration:\s*line-through[^"]*"[^>]*>([\s\S]*?)<\/span>/gi, "~~$1~~");
   md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
   md = md.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi, (_, inner) => {
     const text = inner.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "$1").trim();
@@ -1330,6 +1329,12 @@ var SyncEngine = class _SyncEngine {
     return result;
   }
   // ── Local → Remote ────────────────────────────────────────────────────
+  /** Strip auto-generated comments section from content (appended after every push). */
+  static stripCommentsSection(content) {
+    const markerIdx = content.indexOf(COMMENTS_SECTION_MARKER);
+    if (markerIdx === -1) return content;
+    return content.substring(0, markerIdx).trimEnd();
+  }
   async pushFile(file, result, force = false) {
     var _a, _b, _c;
     const content = await this.vault.read(file);
@@ -1485,7 +1490,8 @@ var SyncEngine = class _SyncEngine {
       await this.refreshLocalComments(file, page2.id);
       return true;
     }
-    const storageBodyForCheck = markdownToConfluenceStorage(content, this.buildTitleToUrl(), this.contextDirForFile(file));
+    const contentForHash = _SyncEngine.stripCommentsSection(content);
+    const storageBodyForCheck = markdownToConfluenceStorage(contentForHash, this.buildTitleToUrl(), this.contextDirForFile(file));
     const storageHash = SyncStateManager.hash(storageBodyForCheck);
     const localChanged = storageHash !== record.contentHash;
     const resolvedParentId = record.confluenceParentId !== void 0 ? await this.resolveParentId(file) : void 0;
@@ -1777,7 +1783,8 @@ var SyncEngine = class _SyncEngine {
       }
       if (contentChanged) {
         if (file instanceof import_obsidian3.TFile) {
-          const localContent = await this.vault.read(file);
+          const localRaw = await this.vault.read(file);
+          const localContent = _SyncEngine.stripCommentsSection(localRaw);
           const localStorageHash = SyncStateManager.hash(markdownToConfluenceStorage(localContent));
           const localChanged = localStorageHash !== record.contentHash;
           if (localChanged) {

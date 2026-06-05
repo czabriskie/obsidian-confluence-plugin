@@ -117,25 +117,19 @@ function convertTables(input: string): string {
             const headerRows = sepIdx > 0 ? rows.slice(0, sepIdx) : [rows[0]];
             const dataRows = sepIdx >= 0 ? rows.slice(sepIdx + 1) : rows.slice(1);
 
-            let out = `<table><colgroup>${headerRows[0].split("|").slice(1, -1).map(() => "<col/>").join("")}</colgroup>`;
+            let out = "<table><tbody>";
 
-            // thead
-            out += "<thead>";
+            // header rows (using <th>)
             for (const row of headerRows) {
                 out += "<tr>" + parseCells(row).map((c) => `<th><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></th>`).join("") + "</tr>";
             }
-            out += "</thead>";
 
-            // tbody
-            if (dataRows.length > 0) {
-                out += "<tbody>";
-                for (const row of dataRows) {
-                    out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></td>`).join("") + "</tr>";
-                }
-                out += "</tbody>";
+            // data rows (using <td>)
+            for (const row of dataRows) {
+                out += "<tr>" + parseCells(row).map((c) => `<td><p>${escapeXmlTextNodes(autoLinkUrls(c))}</p></td>`).join("") + "</tr>";
             }
 
-            out += "</table>";
+            out += "</tbody></table>";
             return out;
         }
     );
@@ -162,7 +156,7 @@ function convertTaskLists(input: string): string {
                 const status = checked ? "complete" : "incomplete";
                 const text = escapeXmlTextNodes(m[2]);
                 const id = taskIdCounter++;
-                return `<ac:task><ac:task-id>${id}</ac:task-id><ac:task-status>${status}</ac:task-status><ac:task-body><span class="placeholder-inline-tasks">${text}</span></ac:task-body></ac:task>`;
+                return `<ac:task><ac:task-id>${id}</ac:task-id><ac:task-status>${status}</ac:task-status><ac:task-body>${text}</ac:task-body></ac:task>`;
             });
             return `<ac:task-list>${tasks.join("")}</ac:task-list>`;
         }
@@ -309,15 +303,15 @@ export function markdownToConfluenceStorage(
                 macro += `<ac:parameter ac:name="title">${escapeXmlText(title.trim())}</ac:parameter>`;
             }
             
+            // Process body content as markdown (inline elements only)
             if (body) {
-                // Process body content as markdown (inline elements only)
                 body = body
                     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
                     .replace(/\*(.+?)\*/g, "<em>$1</em>")
                     .replace(/`(.+?)`/g, "<code>$1</code>")
                     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-                macro += `<ac:rich-text-body><p>${escapeXmlTextNodes(body)}</p></ac:rich-text-body>`;
             }
+            macro += `<ac:rich-text-body><p>${body ? escapeXmlTextNodes(body) : ''}</p></ac:rich-text-body>`;
             
             macro += `</ac:structured-macro>`;
             return macro;
@@ -403,8 +397,11 @@ export function markdownToConfluenceStorage(
     // The opening ``` may appear mid-line (e.g. in a list item like
     // "- CSP errors ```\n...```"), so we allow optional leading text before
     // the opening fence. The leading text is preserved before the macro.
+    // IMPORTANT: Use negative lookbehind/lookahead to avoid matching if there
+    // are backticks immediately before/after (this prevents matching the 3 middle
+    // backticks of 4+ backtick sequences like ````...````).
     html = html.replace(
-        /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+        /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
         (_, prefix, langLine, code) => {
             // Use only the first whitespace-delimited token as the language identifier
             const lang = langLine.trim().split(/\s+/)[0] ?? "";
@@ -424,6 +421,13 @@ export function markdownToConfluenceStorage(
     // that happen to be inside a fenced code block's CDATA section.
     html = applyOutsideCdata(html, convertTables);
 
+    // Multi-backtick inline code — handle `` ``, ``` ```, ```` ````, etc. BEFORE
+    // single-backtick processing to prevent regex from splitting them incorrectly.
+    // This regex matches 2+ backticks with content between them.
+    html = html.replace(/`{2,}([^`]*)`{2,}/g, (_, code) => {
+        return `<code>${escapeXmlText(code)}</code>`;
+    });
+
     // Inline code — escape XML chars so that angle brackets in code spans
     // (e.g. `<iframe>`, `Array<T>`) don't produce invalid XHTML.
     html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
@@ -440,7 +444,7 @@ export function markdownToConfluenceStorage(
         segment = segment.replace(/\*(.+?)\*/g, "<em>$1</em>");
         segment = segment.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
         // Strikethrough
-        segment = segment.replace(/~~(.+?)~~/g, "<del>$1</del>");
+        segment = segment.replace(/~~(.+?)~~/g, '<span style="text-decoration: line-through;">$1</span>');
         return segment;
     });
 
@@ -584,6 +588,7 @@ function inlineHtmlToMd(text: string): string {
     text = text.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
     text = text.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
     text = text.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
+    text = text.replace(/<span[^>]*style="[^"]*text-decoration:\s*line-through[^"]*"[^>]*>([\s\S]*?)<\/span>/gi, "~~$1~~");
     text = text.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
     text = text.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
     text = text.replace(/<br\s*\/?>/gi, " ");
@@ -824,6 +829,7 @@ export function confluenceStorageToMarkdown(storage: string): string {
     md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
     md = md.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
     md = md.replace(/<del[^>]*>([\s\S]*?)<\/del>/gi, "~~$1~~");
+    md = md.replace(/<span[^>]*style="[^"]*text-decoration:\s*line-through[^"]*"[^>]*>([\s\S]*?)<\/span>/gi, "~~$1~~");
     md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
 
     // ── Block elements ────────────────────────────────────────────────────
