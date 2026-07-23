@@ -1609,6 +1609,68 @@ var SyncEngine = class _SyncEngine {
    * Force-push a single file regardless of whether the content hash has changed.
    * Useful when the converter has been fixed and the stored hash is stale.
    */
+  /**
+   * Handle an Obsidian-native rename/move event (`vault.on("rename", file, oldPath)`).
+   *
+   * This is the authoritative rename signal — Obsidian tells us definitively that
+   * `oldPath` became `file.path`, so we don't need to guess via title-matching.
+   * This must run (and update `state`) BEFORE any full `sync()` pass, otherwise
+   * `deleteObsoletePages()` will see `oldPath` missing from the current vault
+   * listing and delete the Confluence page outright, treating the rename as a
+   * delete — which is the bug this method exists to prevent.
+   *
+   * Renames the Confluence page in place (updates title and/or parent as needed)
+   * and moves the sync record from `oldPath` to `file.path`. If there's no
+   * tracked record for `oldPath`, this is a no-op (untracked/excluded file).
+   */
+  async handleLocalRename(file, oldPath) {
+    const record = this.state.get(oldPath);
+    if (!record) return;
+    if (this.vault.getAbstractFileByPath(oldPath)) return;
+    this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
+    const newTitle = this.titleFromFile(file);
+    const newParentId = await this.resolveParentId(file);
+    try {
+      const remotePage = await this.client.getPage(record.confluencePageId);
+      const titleChanged = newTitle !== record.confluenceTitle;
+      const parentChanged = newParentId !== void 0 && newParentId !== record.confluenceParentId;
+      let updatedTitle = record.confluenceTitle;
+      let updatedVersion = record.confluenceVersion;
+      let updatedParentId = record.confluenceParentId;
+      if (titleChanged || parentChanged) {
+        console.log(
+          `[ConfluenceSync] Rename event: "${oldPath}" \u2192 "${file.path}" (title: "${record.confluenceTitle}" \u2192 "${newTitle}")`
+        );
+        const updated = await this.client.updatePage(
+          record.confluencePageId,
+          newTitle,
+          remotePage.body,
+          remotePage.version,
+          newParentId != null ? newParentId : remotePage.parentId
+        );
+        updatedTitle = updated.title;
+        updatedVersion = updated.version;
+        updatedParentId = updated.parentId;
+      }
+      this.state.delete(oldPath);
+      this.state.set(file.path, {
+        ...record,
+        confluenceTitle: updatedTitle,
+        confluenceVersion: updatedVersion,
+        confluenceParentId: updatedParentId
+      });
+      await this.state.save();
+    } catch (e) {
+      if (String(e).includes("404") || String(e).includes("not found")) {
+        this.state.delete(oldPath);
+        this.state.set(file.path, record);
+        await this.state.save();
+        return;
+      }
+      console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" \u2192 "${file.path}":`, e);
+      throw e;
+    }
+  }
   async pushFileDirect(file, force = false) {
     this._foundFolderCache.clear();
     this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
@@ -2440,12 +2502,7 @@ var ConfluenceSyncPlugin = class extends import_obsidian4.Plugin {
     this.addSettingTab(new ConfluenceSyncSettingTab(this.app, this));
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, abstractFile) => {
-        let syncRoot = this.settings.vaultDirectory;
-        const basePath = this.app.vault.adapter.basePath;
-        if (basePath && syncRoot.startsWith(basePath)) {
-          syncRoot = syncRoot.slice(basePath.length).replace(/^\//, "");
-        }
-        if (!abstractFile.path.startsWith(syncRoot)) return;
+        if (!abstractFile.path.startsWith(this.vaultRelativeSyncRoot())) return;
         const isExcluded = this.isExcluded(abstractFile.path);
         const label = isExcluded ? `\u2611 Resume Confluence sync` : `\u2298 Exclude from Confluence sync`;
         menu.addItem(
@@ -2455,7 +2512,34 @@ var ConfluenceSyncPlugin = class extends import_obsidian4.Plugin {
         );
       })
     );
+    this.registerEvent(
+      this.app.vault.on("rename", async (abstractFile, oldPath) => {
+        if (!(abstractFile instanceof import_obsidian4.TFile) || abstractFile.extension !== "md") return;
+        if (!oldPath.endsWith(".md")) return;
+        const syncRoot = this.vaultRelativeSyncRoot();
+        if (!oldPath.startsWith(syncRoot) && !abstractFile.path.startsWith(syncRoot)) return;
+        if (this.isExcluded(oldPath) || this.isExcluded(abstractFile.path)) return;
+        const client = this.getClient();
+        if (!client) return;
+        const engine = new SyncEngine(this.app.vault, client, this.stateManager, this.settings);
+        try {
+          await engine.handleLocalRename(abstractFile, oldPath);
+        } catch (e) {
+          console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" \u2192 "${abstractFile.path}":`, e);
+          new import_obsidian4.Notice(`\u26A0\uFE0F Confluence Sync: failed to reconcile rename of "${abstractFile.basename}". Run a manual sync to retry.`);
+        }
+      })
+    );
     this.resetAutoSync();
+  }
+  /** Resolve the configured sync directory to a vault-relative path. */
+  vaultRelativeSyncRoot() {
+    let syncRoot = this.settings.vaultDirectory;
+    const basePath = this.app.vault.adapter.basePath;
+    if (basePath && syncRoot.startsWith(basePath)) {
+      syncRoot = syncRoot.slice(basePath.length).replace(/^\//, "");
+    }
+    return syncRoot;
   }
   onunload() {
     this.clearAutoSync();

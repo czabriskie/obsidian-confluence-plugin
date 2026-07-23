@@ -146,16 +146,8 @@ export default class ConfluenceSyncPlugin extends Plugin {
         // File-explorer context menu: toggle exclusion
         this.registerEvent(
             this.app.workspace.on("file-menu", (menu, abstractFile) => {
-                // Resolve the sync root to a vault-relative path
-                // (vaultDirectory may be stored as an absolute path)
-                let syncRoot = this.settings.vaultDirectory;
-                const basePath = (this.app.vault.adapter as any).basePath as string | undefined;
-                if (basePath && syncRoot.startsWith(basePath)) {
-                    syncRoot = syncRoot.slice(basePath.length).replace(/^\//, "");
-                }
-
                 // Only show for files/folders inside the sync directory
-                if (!abstractFile.path.startsWith(syncRoot)) return;
+                if (!abstractFile.path.startsWith(this.vaultRelativeSyncRoot())) return;
 
                 const isExcluded = this.isExcluded(abstractFile.path);
                 const label = isExcluded
@@ -173,8 +165,45 @@ export default class ConfluenceSyncPlugin extends Plugin {
             })
         );
 
+        // React to Obsidian-native renames/moves immediately, rather than waiting
+        // for the next full sync() to guess (incorrectly — see handleLocalRename's
+        // docstring) what happened from a before/after file listing diff. This is
+        // what prevents a rename from being mistaken for delete+create, which
+        // previously caused the Confluence page (and its comments) to be deleted.
+        this.registerEvent(
+            this.app.vault.on("rename", async (abstractFile, oldPath) => {
+                if (!(abstractFile instanceof TFile) || abstractFile.extension !== "md") return;
+                if (!oldPath.endsWith(".md")) return;
+
+                const syncRoot = this.vaultRelativeSyncRoot();
+                if (!oldPath.startsWith(syncRoot) && !abstractFile.path.startsWith(syncRoot)) return;
+                if (this.isExcluded(oldPath) || this.isExcluded(abstractFile.path)) return;
+
+                const client = this.getClient();
+                if (!client) return; // not configured — nothing to reconcile against
+
+                const engine = new SyncEngine(this.app.vault, client, this.stateManager, this.settings);
+                try {
+                    await engine.handleLocalRename(abstractFile, oldPath);
+                } catch (e) {
+                    console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" → "${abstractFile.path}":`, e);
+                    new Notice(`⚠️ Confluence Sync: failed to reconcile rename of "${abstractFile.basename}". Run a manual sync to retry.`);
+                }
+            })
+        );
+
         // Auto-sync
         this.resetAutoSync();
+    }
+
+    /** Resolve the configured sync directory to a vault-relative path. */
+    private vaultRelativeSyncRoot(): string {
+        let syncRoot = this.settings.vaultDirectory;
+        const basePath = (this.app.vault.adapter as any).basePath as string | undefined;
+        if (basePath && syncRoot.startsWith(basePath)) {
+            syncRoot = syncRoot.slice(basePath.length).replace(/^\//, "");
+        }
+        return syncRoot;
     }
 
     onunload() {

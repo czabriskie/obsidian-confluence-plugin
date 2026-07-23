@@ -613,6 +613,83 @@ export class SyncEngine {
      * Force-push a single file regardless of whether the content hash has changed.
      * Useful when the converter has been fixed and the stored hash is stale.
      */
+    /**
+     * Handle an Obsidian-native rename/move event (`vault.on("rename", file, oldPath)`).
+     *
+     * This is the authoritative rename signal — Obsidian tells us definitively that
+     * `oldPath` became `file.path`, so we don't need to guess via title-matching.
+     * This must run (and update `state`) BEFORE any full `sync()` pass, otherwise
+     * `deleteObsoletePages()` will see `oldPath` missing from the current vault
+     * listing and delete the Confluence page outright, treating the rename as a
+     * delete — which is the bug this method exists to prevent.
+     *
+     * Renames the Confluence page in place (updates title and/or parent as needed)
+     * and moves the sync record from `oldPath` to `file.path`. If there's no
+     * tracked record for `oldPath`, this is a no-op (untracked/excluded file).
+     */
+    async handleLocalRename(file: TFile, oldPath: string): Promise<void> {
+        const record = this.state.get(oldPath);
+        if (!record) return; // not a tracked file — nothing to reconcile
+
+        // Guard: if another file now sits at oldPath (rare edge case with rapid
+        // successive renames), this isn't a simple rename — leave it for the
+        // next full sync to sort out via title-matching.
+        if (this.vault.getAbstractFileByPath(oldPath)) return;
+
+        this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
+        const newTitle = this.titleFromFile(file);
+        const newParentId = await this.resolveParentId(file);
+
+        try {
+            const remotePage = await this.client.getPage(record.confluencePageId);
+            const titleChanged = newTitle !== record.confluenceTitle;
+            const parentChanged = newParentId !== undefined && newParentId !== record.confluenceParentId;
+
+            let updatedTitle = record.confluenceTitle;
+            let updatedVersion = record.confluenceVersion;
+            let updatedParentId = record.confluenceParentId;
+
+            if (titleChanged || parentChanged) {
+                console.log(
+                    `[ConfluenceSync] Rename event: "${oldPath}" → "${file.path}" ` +
+                    `(title: "${record.confluenceTitle}" → "${newTitle}")`
+                );
+                const updated = await this.client.updatePage(
+                    record.confluencePageId,
+                    newTitle,
+                    remotePage.body,
+                    remotePage.version,
+                    newParentId ?? remotePage.parentId
+                );
+                updatedTitle = updated.title;
+                updatedVersion = updated.version;
+                updatedParentId = updated.parentId;
+            }
+
+            this.state.delete(oldPath);
+            this.state.set(file.path, {
+                ...record,
+                confluenceTitle: updatedTitle,
+                confluenceVersion: updatedVersion,
+                confluenceParentId: updatedParentId,
+            });
+            await this.state.save();
+        } catch (e: any) {
+            if (String(e).includes("404") || String(e).includes("not found")) {
+                // Remote page already gone — just move the (now-orphaned) record;
+                // the next full sync will recreate it fresh at the new path.
+                this.state.delete(oldPath);
+                this.state.set(file.path, record);
+                await this.state.save();
+                return;
+            }
+            // Don't swallow other errors silently — leave the old record in place
+            // (so this rename can be retried) rather than risking data loss.
+            console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" → "${file.path}":`, e);
+            throw e;
+        }
+    }
+
     async pushFileDirect(file: TFile, force = false): Promise<SyncResult> {
         this._foundFolderCache.clear();
         this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
