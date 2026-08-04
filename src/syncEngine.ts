@@ -9,12 +9,13 @@
  * "Changed" is determined by comparing a content hash stored in SyncStateManager.
  */
 
-import { TFile, TFolder, Vault, normalizePath } from "obsidian";
+import { TFile, TFolder, Vault, normalizePath, requestUrl } from "obsidian";
 import { ConfluenceClient, ConfluencePage } from "./confluenceClient";
 import {
     markdownToConfluenceStorage,
     confluenceStorageToMarkdown,
     extractEmbeddedImages,
+    extractMermaidDiagrams,
     COMMENTS_SECTION_MARKER,
     formatCommentsAsMarkdown,
     preserveInlineCommentMarkers,
@@ -1620,11 +1621,12 @@ export class SyncEngine {
 
     /**
      * Upload all images embedded in `markdown` as attachments on `pageId`.
-     * Silently skips images that cannot be found in the vault.
+     * Silently skips images that cannot be found in the vault. Also renders
+     * and uploads any Mermaid diagrams found in ```mermaid fences, since
+     * Confluence has no native Mermaid renderer.
      */
     private async uploadPageImages(pageId: string, markdown: string, sourceFile: TFile): Promise<void> {
         const imageFilenames = extractEmbeddedImages(markdown);
-        if (imageFilenames.length === 0) return;
 
         for (const filename of imageFilenames) {
             // Search the vault for the image file by name
@@ -1649,6 +1651,37 @@ export class SyncEngine {
                 console.log(`[ConfluenceSync] Uploaded attachment: ${imageFile.name} → page ${pageId}`);
             } catch (e) {
                 console.error(`[ConfluenceSync] Failed to upload attachment ${filename}:`, e);
+            }
+        }
+
+        await this.uploadMermaidDiagrams(pageId, markdown);
+    }
+
+    /**
+     * Renders each unique Mermaid diagram found in `markdown` to a PNG (via the
+     * public mermaid.ink rendering service) and uploads it as a Confluence
+     * attachment under the deterministic filename `mermaidDiagramFilename()`
+     * produces — matching what `markdownToConfluenceStorage()` referenced in
+     * the pushed page body's <ac:image> tag.
+     */
+    private async uploadMermaidDiagrams(pageId: string, markdown: string): Promise<void> {
+        const diagrams = extractMermaidDiagrams(markdown);
+        if (diagrams.length === 0) return;
+
+        for (const { code, filename } of diagrams) {
+            try {
+                const payload = JSON.stringify({ code, mermaid: { theme: "default" } });
+                const encoded = Buffer.from(payload, "utf-8").toString("base64url");
+                const url = `https://mermaid.ink/img/${encoded}?type=png`;
+                const response = await requestUrl({ url, method: "GET" });
+                if (response.status !== 200) {
+                    console.error(`[ConfluenceSync] Mermaid render failed (${response.status}) for ${filename}`);
+                    continue;
+                }
+                await this.client.uploadAttachment(pageId, filename, response.arrayBuffer, "image/png");
+                console.log(`[ConfluenceSync] Uploaded Mermaid diagram: ${filename} → page ${pageId}`);
+            } catch (e) {
+                console.error(`[ConfluenceSync] Failed to render/upload Mermaid diagram ${filename}:`, e);
             }
         }
     }

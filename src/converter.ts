@@ -48,6 +48,56 @@ export function extractEmbeddedImages(markdown: string): string[] {
     return [...seen];
 }
 
+/** Matches fenced ```mermaid code blocks (mirrors the generic fence regex used for code blocks). */
+const MERMAID_FENCE_RE = /^[ \t]*```mermaid[ \t]*\n([\s\S]*?)^[ \t]*```[ \t]*$/gm;
+
+/** Deterministic short hash (djb2) used to derive stable attachment filenames for diagrams. */
+function djb2Hex(text: string): string {
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) {
+        hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+}
+
+/** UTF-8 safe base64 encode/decode (Buffer is available under Obsidian's Electron/Node runtime). */
+function base64EncodeUtf8(text: string): string {
+    return Buffer.from(text, "utf-8").toString("base64");
+}
+function base64DecodeUtf8(b64: string): string {
+    return Buffer.from(b64, "base64").toString("utf-8");
+}
+
+/** Returns the attachment filename Confluence will use for a rendered Mermaid diagram. */
+export function mermaidDiagramFilename(code: string): string {
+    return `mermaid-${djb2Hex(code.trim())}.png`;
+}
+
+export interface MermaidDiagram {
+    /** Raw Mermaid source (trimmed). */
+    code: string;
+    /** Deterministic attachment filename this diagram will be rendered/uploaded as. */
+    filename: string;
+}
+
+/**
+ * Returns the unique Mermaid diagrams found in fenced ```mermaid code blocks.
+ * These are rendered to PNG (via SyncEngine) and uploaded as Confluence attachments,
+ * since Confluence has no native Mermaid renderer.
+ */
+export function extractMermaidDiagrams(markdown: string): MermaidDiagram[] {
+    const seen = new Map<string, MermaidDiagram>();
+    const re = new RegExp(MERMAID_FENCE_RE.source, "gm");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(markdown)) !== null) {
+        const code = m[1].trim();
+        if (!code) continue;
+        const filename = mermaidDiagramFilename(code);
+        if (!seen.has(filename)) seen.set(filename, { code, filename });
+    }
+    return [...seen.values()];
+}
+
 // ---------------------------------------------------------------------------
 // Table conversion helper
 // ---------------------------------------------------------------------------
@@ -387,6 +437,25 @@ export function markdownToConfluenceStorage(
     html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
     html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
 
+    // Mermaid diagrams: ```mermaid fences → Confluence attachment image macro.
+    // Confluence has no native Mermaid renderer, so SyncEngine renders these to
+    // PNG (via an external rendering service) and uploads them as attachments;
+    // here we just emit the reference to that attachment. Must run BEFORE the
+    // generic code-fence pass below, otherwise mermaid blocks would be converted
+    // to a plain (non-rendering) code macro instead.
+    //
+    // The original Mermaid source is preserved verbatim in a preceding HTML
+    // comment (base64-encoded) so that pulling the page back down reconstructs
+    // the exact ```mermaid fence instead of leaving a plain image embed —
+    // the local .md file always keeps the editable diagram source, never a
+    // flattened image.
+    html = html.replace(MERMAID_FENCE_RE, (_, rawCode) => {
+        const code = rawCode.trim();
+        const filename = mermaidDiagramFilename(code);
+        const encoded = base64EncodeUtf8(code);
+        return `<!--mermaid:${encoded}--><ac:image><ri:attachment ri:filename="${filename}"/></ac:image>`;
+    });
+
     // Code blocks (fenced).
     // The language token after the opening ``` may be:
     //   - absent          → ```\n
@@ -397,11 +466,8 @@ export function markdownToConfluenceStorage(
     // The opening ``` may appear mid-line (e.g. in a list item like
     // "- CSP errors ```\n...```"), so we allow optional leading text before
     // the opening fence. The leading text is preserved before the macro.
-    // IMPORTANT: Use negative lookbehind/lookahead to avoid matching if there
-    // are backticks immediately before/after (this prevents matching the 3 middle
-    // backticks of 4+ backtick sequences like ````...````).
     html = html.replace(
-        /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+        /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
         (_, prefix, langLine, code) => {
             // Use only the first whitespace-delimited token as the language identifier
             const lang = langLine.trim().split(/\s+/)[0] ?? "";
@@ -420,13 +486,6 @@ export function markdownToConfluenceStorage(
     // the pipe structure. applyOutsideCdata ensures we never touch pipe chars
     // that happen to be inside a fenced code block's CDATA section.
     html = applyOutsideCdata(html, convertTables);
-
-    // Multi-backtick inline code — handle `` ``, ``` ```, ```` ````, etc. BEFORE
-    // single-backtick processing to prevent regex from splitting them incorrectly.
-    // This regex matches 2+ backticks with content between them.
-    html = html.replace(/`{2,}([^`]*)`{2,}/g, (_, code) => {
-        return `<code>${escapeXmlText(code)}</code>`;
-    });
 
     // Inline code — escape XML chars so that angle brackets in code spans
     // (e.g. `<iframe>`, `Array<T>`) don't produce invalid XHTML.
@@ -746,6 +805,9 @@ function replaceTopLevelTag(
 
 export function confluenceStorageToMarkdown(storage: string): string {
     let md = storage;
+    // Decoded Mermaid diagram sources, indexed and swapped back in at the very
+    // end of this function (see the Mermaid handling in the Images section).
+    const mermaidPlaceholders: string[] = [];
 
     // ── Structured macros (must be processed before generic tag stripping) ──
 
@@ -799,6 +861,31 @@ export function confluenceStorageToMarkdown(storage: string): string {
     md = md.replace(/<ac:structured-macro[^>]*>[\s\S]*?<\/ac:structured-macro>/g, "");
 
     // ── Images ────────────────────────────────────────────────────────────
+
+    // Mermaid diagrams: reconstruct the original ```mermaid fence from the
+    // base64-encoded source stashed in the preceding HTML comment (see
+    // markdownToConfluenceStorage). Must run BEFORE the generic attachment
+    // image regex below, otherwise these would become a plain (unrecoverable)
+    // ![[mermaid-xxxx.png]] embed and the editable diagram source would be lost.
+    //
+    // The decoded source is stashed behind a NUL-delimited placeholder (not
+    // substituted in directly) because later passes in this function (HTML
+    // entity decoding, <br/> → \n, tag stripping, etc.) would otherwise mangle
+    // Mermaid syntax that itself legitimately contains HTML-like tokens, e.g.
+    // `A["Start<br/>here"]`. The placeholder is swapped back for the real
+    // fenced block at the very end, after all other cleanup has run.
+    md = md.replace(
+        /<!--mermaid:([A-Za-z0-9+/=]+)-->\s*<ac:image[^>]*>\s*<ri:attachment ri:filename="[^"]+"[^/]*\/>\s*<\/ac:image>/gi,
+        (_, encoded) => {
+            try {
+                const code = base64DecodeUtf8(encoded);
+                const idx = mermaidPlaceholders.push(code) - 1;
+                return `\u0000MERMAID${idx}\u0000`;
+            } catch {
+                return "";
+            }
+        }
+    );
 
     // Attachment images → ![[filename]]
     md = md.replace(
@@ -862,6 +949,14 @@ export function confluenceStorageToMarkdown(storage: string): string {
     // ── Entity decoding ───────────────────────────────────────────────────
 
     md = decodeHtmlEntities(md);
+
+    // Restore Mermaid diagrams (must run after entity decoding / tag stripping
+    // so the raw source — which may itself contain `<`, `>`, `&`, etc. — is
+    // never touched by those passes).
+    md = md.replace(
+        /\u0000MERMAID(\d+)\u0000/g,
+        (_, i) => "\n\n```mermaid\n" + mermaidPlaceholders[Number(i)] + "\n```\n\n"
+    );
 
     // ── Whitespace cleanup ────────────────────────────────────────────────
 

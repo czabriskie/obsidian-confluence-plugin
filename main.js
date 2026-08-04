@@ -543,6 +543,35 @@ function extractEmbeddedImages(markdown) {
   }
   return [...seen];
 }
+var MERMAID_FENCE_RE = /^[ \t]*```mermaid[ \t]*\n([\s\S]*?)^[ \t]*```[ \t]*$/gm;
+function djb2Hex(text) {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) {
+    hash = (hash << 5) + hash + text.charCodeAt(i) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+function base64EncodeUtf8(text) {
+  return Buffer.from(text, "utf-8").toString("base64");
+}
+function base64DecodeUtf8(b64) {
+  return Buffer.from(b64, "base64").toString("utf-8");
+}
+function mermaidDiagramFilename(code) {
+  return `mermaid-${djb2Hex(code.trim())}.png`;
+}
+function extractMermaidDiagrams(markdown) {
+  const seen = /* @__PURE__ */ new Map();
+  const re = new RegExp(MERMAID_FENCE_RE.source, "gm");
+  let m;
+  while ((m = re.exec(markdown)) !== null) {
+    const code = m[1].trim();
+    if (!code) continue;
+    const filename = mermaidDiagramFilename(code);
+    if (!seen.has(filename)) seen.set(filename, { code, filename });
+  }
+  return [...seen.values()];
+}
 function applyOutsideCdata(input, fn) {
   const parts = input.split(/(<!\[CDATA\[[\s\S]*?\]\]>)/);
   return parts.map((part, i) => i % 2 === 0 ? fn(part) : part).join("");
@@ -736,8 +765,14 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
   html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
   html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
   html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+  html = html.replace(MERMAID_FENCE_RE, (_, rawCode) => {
+    const code = rawCode.trim();
+    const filename = mermaidDiagramFilename(code);
+    const encoded = base64EncodeUtf8(code);
+    return `<!--mermaid:${encoded}--><ac:image><ri:attachment ri:filename="${filename}"/></ac:image>`;
+  });
   html = html.replace(
-    /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+    /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
     (_, prefix, langLine, code) => {
       var _a;
       const lang = (_a = langLine.trim().split(/\s+/)[0]) != null ? _a : "";
@@ -745,9 +780,6 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
     }
   );
   html = applyOutsideCdata(html, convertTables);
-  html = html.replace(/`{2,}([^`]*)`{2,}/g, (_, code) => {
-    return `<code>${escapeXmlText(code)}</code>`;
-  });
   html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
   html = applyOutsideCdata(html, (segment) => {
     segment = segment.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
@@ -985,6 +1017,7 @@ function replaceTopLevelTag(html, tag, convert) {
 }
 function confluenceStorageToMarkdown(storage) {
   let md = storage;
+  const mermaidPlaceholders = [];
   md = md.replace(
     /<ac:task-list>([\s\S]*?)<\/ac:task-list>/gi,
     (_, inner) => {
@@ -1031,6 +1064,18 @@ function confluenceStorageToMarkdown(storage) {
   );
   md = md.replace(/<ac:structured-macro[^>]*>[\s\S]*?<\/ac:structured-macro>/g, "");
   md = md.replace(
+    /<!--mermaid:([A-Za-z0-9+/=]+)-->\s*<ac:image[^>]*>\s*<ri:attachment ri:filename="[^"]+"[^/]*\/>\s*<\/ac:image>/gi,
+    (_, encoded) => {
+      try {
+        const code = base64DecodeUtf8(encoded);
+        const idx = mermaidPlaceholders.push(code) - 1;
+        return `\0MERMAID${idx}\0`;
+      } catch (e) {
+        return "";
+      }
+    }
+  );
+  md = md.replace(
     /<ac:image[^>]*>\s*<ri:attachment ri:filename="([^"]+)"[^/]*\/>\s*<\/ac:image>/gi,
     "![[$1]]"
   );
@@ -1061,6 +1106,10 @@ function confluenceStorageToMarkdown(storage) {
   md = md.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "$1\n\n");
   md = md.replace(/<[^>]+>/g, "");
   md = decodeHtmlEntities(md);
+  md = md.replace(
+    /\u0000MERMAID(\d+)\u0000/g,
+    (_, i) => "\n\n```mermaid\n" + mermaidPlaceholders[Number(i)] + "\n```\n\n"
+  );
   md = md.replace(/\n{3,}/g, "\n\n").trim();
   return md;
 }
@@ -2353,12 +2402,13 @@ var SyncEngine = class _SyncEngine {
   }
   /**
    * Upload all images embedded in `markdown` as attachments on `pageId`.
-   * Silently skips images that cannot be found in the vault.
+   * Silently skips images that cannot be found in the vault. Also renders
+   * and uploads any Mermaid diagrams found in ```mermaid fences, since
+   * Confluence has no native Mermaid renderer.
    */
   async uploadPageImages(pageId, markdown, sourceFile) {
     var _a;
     const imageFilenames = extractEmbeddedImages(markdown);
-    if (imageFilenames.length === 0) return;
     for (const filename of imageFilenames) {
       const imageFile = this.vault.getFiles().find(
         (f) => f.name === filename || f.path === filename
@@ -2385,6 +2435,34 @@ var SyncEngine = class _SyncEngine {
         console.log(`[ConfluenceSync] Uploaded attachment: ${imageFile.name} \u2192 page ${pageId}`);
       } catch (e) {
         console.error(`[ConfluenceSync] Failed to upload attachment ${filename}:`, e);
+      }
+    }
+    await this.uploadMermaidDiagrams(pageId, markdown);
+  }
+  /**
+   * Renders each unique Mermaid diagram found in `markdown` to a PNG (via the
+   * public mermaid.ink rendering service) and uploads it as a Confluence
+   * attachment under the deterministic filename `mermaidDiagramFilename()`
+   * produces — matching what `markdownToConfluenceStorage()` referenced in
+   * the pushed page body's <ac:image> tag.
+   */
+  async uploadMermaidDiagrams(pageId, markdown) {
+    const diagrams = extractMermaidDiagrams(markdown);
+    if (diagrams.length === 0) return;
+    for (const { code, filename } of diagrams) {
+      try {
+        const payload = JSON.stringify({ code, mermaid: { theme: "default" } });
+        const encoded = Buffer.from(payload, "utf-8").toString("base64url");
+        const url = `https://mermaid.ink/img/${encoded}?type=png`;
+        const response = await (0, import_obsidian3.requestUrl)({ url, method: "GET" });
+        if (response.status !== 200) {
+          console.error(`[ConfluenceSync] Mermaid render failed (${response.status}) for ${filename}`);
+          continue;
+        }
+        await this.client.uploadAttachment(pageId, filename, response.arrayBuffer, "image/png");
+        console.log(`[ConfluenceSync] Uploaded Mermaid diagram: ${filename} \u2192 page ${pageId}`);
+      } catch (e) {
+        console.error(`[ConfluenceSync] Failed to render/upload Mermaid diagram ${filename}:`, e);
       }
     }
   }
