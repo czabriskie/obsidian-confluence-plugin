@@ -154,6 +154,34 @@ describe("SyncStateManager", () => {
         expect(Object.keys(manager.allFolders())).toHaveLength(0);
     });
 
+    it("clearAll backs up prior state so it can be restored", async () => {
+        manager.set("a.md", {
+            confluencePageId: "1",
+            confluenceTitle: "A",
+            confluenceVersion: 1,
+            lastSyncedAt: "",
+            contentHash: "",
+        });
+        manager.setFolder("d", "2");
+
+        expect(await manager.getLastBackupTimestamp()).toBeUndefined();
+
+        await manager.clearAll();
+
+        expect(Object.keys(manager.all())).toHaveLength(0);
+        expect(await manager.getLastBackupTimestamp()).toBeDefined();
+
+        const restored = await manager.restoreLastBackup();
+        expect(restored).toBe(true);
+        expect(manager.get("a.md")?.confluencePageId).toBe("1");
+        expect(manager.getFolder("d")).toBe("2");
+    });
+
+    it("restoreLastBackup returns false when there is nothing to restore", async () => {
+        const restored = await manager.restoreLastBackup();
+        expect(restored).toBe(false);
+    });
+
     // ── Static hash ──────────────────────────────────────────────────────
 
     it("hash returns a hex string", () => {

@@ -453,6 +453,7 @@ var ConfluenceClient = class {
 // src/syncStateManager.ts
 var SYNC_MAP_KEY = "syncMap";
 var FOLDER_MAP_KEY = "folderMap";
+var BACKUP_KEY = "syncMapBackup";
 var SyncStateManager = class {
   constructor(plugin) {
     __publicField(this, "plugin");
@@ -491,10 +492,45 @@ var SyncStateManager = class {
   all() {
     return { ...this.map };
   }
+  /**
+   * Clears the sync map and folder map, but first stashes the previous
+   * state under a backup key in plugin data so it can be restored via
+   * `restoreLastBackup()` if the reset was accidental.
+   */
   async clearAll() {
+    var _a;
+    const data = (_a = await this.plugin.loadData()) != null ? _a : {};
+    data[BACKUP_KEY] = {
+      [SYNC_MAP_KEY]: this.map,
+      [FOLDER_MAP_KEY]: this.folders,
+      clearedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
     this.map = {};
     this.folders = {};
+    data[SYNC_MAP_KEY] = this.map;
+    data[FOLDER_MAP_KEY] = this.folders;
+    await this.plugin.saveData(data);
+  }
+  /** Returns the timestamp of the last `clearAll()` backup, if one exists. */
+  async getLastBackupTimestamp() {
+    var _a;
+    const data = await this.plugin.loadData();
+    return (_a = data == null ? void 0 : data[BACKUP_KEY]) == null ? void 0 : _a.clearedAt;
+  }
+  /**
+   * Restores the sync map and folder map from the most recent `clearAll()`
+   * backup, overwriting whatever is currently in state. Returns false if no
+   * backup is available.
+   */
+  async restoreLastBackup() {
+    var _a, _b, _c;
+    const data = (_a = await this.plugin.loadData()) != null ? _a : {};
+    const backup = data[BACKUP_KEY];
+    if (!backup) return false;
+    this.map = (_b = backup[SYNC_MAP_KEY]) != null ? _b : {};
+    this.folders = (_c = backup[FOLDER_MAP_KEY]) != null ? _c : {};
     await this.save();
+    return true;
   }
   getFolder(dirPath) {
     return this.folders[dirPath];
@@ -2549,8 +2585,42 @@ var ConfluenceSyncPlugin = class extends import_obsidian4.Plugin {
       id: "confluence-reset-sync-state",
       name: "Reset sync state (re-sync everything on next run)",
       callback: async () => {
-        await this.stateManager.clearAll();
-        new import_obsidian4.Notice("\u{1F5D1}\uFE0F Confluence Sync: Sync state cleared. Next sync will treat all files as new.");
+        const recordCount = Object.keys(this.stateManager.all()).length;
+        new ConfirmModal(
+          this.app,
+          "Reset Confluence sync state?",
+          `This will erase the local mapping between ${recordCount} vault file(s) and their Confluence pages (page IDs, versions, content hashes, and folder links). The next sync will treat every file as untracked. The plugin will try to relink files to existing Confluence pages by title, but any title mismatch, duplicate title, or ambiguous match can result in duplicate pages being created in Confluence. A backup of the current mapping will be kept and can be restored with "Undo reset sync state" if you change your mind, but it will be overwritten by the next reset.`,
+          "Reset sync state",
+          async () => {
+            await this.stateManager.clearAll();
+            new import_obsidian4.Notice('\u{1F5D1}\uFE0F Confluence Sync: Sync state cleared. Next sync will treat all files as new. Use "Undo reset sync state" to restore.');
+          }
+        ).open();
+      }
+    });
+    this.addCommand({
+      id: "confluence-undo-reset-sync-state",
+      name: "Undo reset sync state (restore previous mapping)",
+      callback: async () => {
+        const timestamp = await this.stateManager.getLastBackupTimestamp();
+        if (!timestamp) {
+          new import_obsidian4.Notice("\u26A0\uFE0F Confluence Sync: No backup available to restore.");
+          return;
+        }
+        new ConfirmModal(
+          this.app,
+          "Restore previous sync state?",
+          `This will restore the sync mapping as it was before the last reset (backed up at ${timestamp}), overwriting the current mapping. Any syncs that happened since the reset will no longer be reflected in the restored state.`,
+          "Restore mapping",
+          async () => {
+            const restored = await this.stateManager.restoreLastBackup();
+            if (restored) {
+              new import_obsidian4.Notice("\u2705 Confluence Sync: Previous sync mapping restored.");
+            } else {
+              new import_obsidian4.Notice("\u26A0\uFE0F Confluence Sync: No backup available to restore.");
+            }
+          }
+        ).open();
       }
     });
     this.addCommand({
@@ -2562,19 +2632,27 @@ var ConfluenceSyncPlugin = class extends import_obsidian4.Plugin {
           new import_obsidian4.Notice("\u26A0\uFE0F Confluence Sync: Plugin not configured.");
           return;
         }
-        const engine = new SyncEngine(
-          this.app.vault,
-          client,
-          this.stateManager,
-          this.settings
-        );
-        const deleted = await engine.deleteUnmanagedLocalFiles();
-        if (deleted.length === 0) {
-          new import_obsidian4.Notice("\u2705 Confluence Sync: No unmanaged local files found.");
-        } else {
-          new import_obsidian4.Notice(`\u{1F5D1}\uFE0F Confluence Sync: Deleted ${deleted.length} unmanaged file(s). Check console for details.`);
-          console.log("[ConfluenceSync] Deleted unmanaged files:", deleted);
-        }
+        new ConfirmModal(
+          this.app,
+          "Delete unmanaged local files?",
+          `This will permanently delete any local .md file under "${this.settings.vaultDirectory}" that has no matching Confluence sync record. This is intended to clean up leftovers from a bad pull, but it will also delete any legitimate file that isn't currently tracked (e.g. right after a sync-state reset). This action cannot be undone.`,
+          "Delete unmanaged files",
+          async () => {
+            const engine = new SyncEngine(
+              this.app.vault,
+              client,
+              this.stateManager,
+              this.settings
+            );
+            const deleted = await engine.deleteUnmanagedLocalFiles();
+            if (deleted.length === 0) {
+              new import_obsidian4.Notice("\u2705 Confluence Sync: No unmanaged local files found.");
+            } else {
+              new import_obsidian4.Notice(`\u{1F5D1}\uFE0F Confluence Sync: Deleted ${deleted.length} unmanaged file(s). Check console for details.`);
+              console.log("[ConfluenceSync] Deleted unmanaged files:", deleted);
+            }
+          }
+        ).open();
       }
     });
     this.addSettingTab(new ConfluenceSyncSettingTab(this.app, this));
@@ -2799,6 +2877,42 @@ var ConfluenceSyncPlugin = class extends import_obsidian4.Plugin {
     } catch (e) {
       new import_obsidian4.Notice(`\u274C Pull failed: ${e}`);
     }
+  }
+};
+var ConfirmModal = class extends import_obsidian4.Modal {
+  constructor(app, title, message, confirmLabel, onConfirm) {
+    super(app);
+    __publicField(this, "title");
+    __publicField(this, "message");
+    __publicField(this, "confirmLabel");
+    __publicField(this, "onConfirm");
+    this.title = title;
+    this.message = message;
+    this.confirmLabel = confirmLabel;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: this.title });
+    contentEl.createEl("p", { text: this.message });
+    const buttonRow = contentEl.createDiv({ cls: "confluence-sync-confirm-buttons" });
+    buttonRow.style.display = "flex";
+    buttonRow.style.justifyContent = "flex-end";
+    buttonRow.style.gap = "8px";
+    buttonRow.style.marginTop = "16px";
+    const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+    cancelButton.addEventListener("click", () => this.close());
+    const confirmButton = buttonRow.createEl("button", {
+      text: this.confirmLabel,
+      cls: "mod-warning"
+    });
+    confirmButton.addEventListener("click", async () => {
+      this.close();
+      await this.onConfirm();
+    });
+  }
+  onClose() {
+    this.contentEl.empty();
   }
 };
 var SyncErrorModal = class extends import_obsidian4.Modal {

@@ -24,6 +24,7 @@ export type FolderMap = Record<string, string>;
 
 const SYNC_MAP_KEY = "syncMap";
 const FOLDER_MAP_KEY = "folderMap";
+const BACKUP_KEY = "syncMapBackup";
 
 export class SyncStateManager {
     private plugin: Plugin;
@@ -70,10 +71,44 @@ export class SyncStateManager {
         return { ...this.map };
     }
 
+    /**
+     * Clears the sync map and folder map, but first stashes the previous
+     * state under a backup key in plugin data so it can be restored via
+     * `restoreLastBackup()` if the reset was accidental.
+     */
     async clearAll(): Promise<void> {
+        const data = (await this.plugin.loadData()) ?? {};
+        data[BACKUP_KEY] = {
+            [SYNC_MAP_KEY]: this.map,
+            [FOLDER_MAP_KEY]: this.folders,
+            clearedAt: new Date().toISOString(),
+        };
         this.map = {};
         this.folders = {};
+        data[SYNC_MAP_KEY] = this.map;
+        data[FOLDER_MAP_KEY] = this.folders;
+        await this.plugin.saveData(data);
+    }
+
+    /** Returns the timestamp of the last `clearAll()` backup, if one exists. */
+    async getLastBackupTimestamp(): Promise<string | undefined> {
+        const data = await this.plugin.loadData();
+        return data?.[BACKUP_KEY]?.clearedAt;
+    }
+
+    /**
+     * Restores the sync map and folder map from the most recent `clearAll()`
+     * backup, overwriting whatever is currently in state. Returns false if no
+     * backup is available.
+     */
+    async restoreLastBackup(): Promise<boolean> {
+        const data = (await this.plugin.loadData()) ?? {};
+        const backup = data[BACKUP_KEY];
+        if (!backup) return false;
+        this.map = backup[SYNC_MAP_KEY] ?? {};
+        this.folders = backup[FOLDER_MAP_KEY] ?? {};
         await this.save();
+        return true;
     }
 
     getFolder(dirPath: string): string | undefined {

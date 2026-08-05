@@ -110,8 +110,50 @@ export default class ConfluenceSyncPlugin extends Plugin {
             id: "confluence-reset-sync-state",
             name: "Reset sync state (re-sync everything on next run)",
             callback: async () => {
-                await this.stateManager.clearAll();
-                new Notice("🗑️ Confluence Sync: Sync state cleared. Next sync will treat all files as new.");
+                const recordCount = Object.keys(this.stateManager.all()).length;
+                new ConfirmModal(
+                    this.app,
+                    "Reset Confluence sync state?",
+                    `This will erase the local mapping between ${recordCount} vault file(s) and their Confluence pages ` +
+                        `(page IDs, versions, content hashes, and folder links). The next sync will treat every file as untracked. ` +
+                        `The plugin will try to relink files to existing Confluence pages by title, but any title mismatch, ` +
+                        `duplicate title, or ambiguous match can result in duplicate pages being created in Confluence. ` +
+                        `A backup of the current mapping will be kept and can be restored with "Undo reset sync state" ` +
+                        `if you change your mind, but it will be overwritten by the next reset.`,
+                    "Reset sync state",
+                    async () => {
+                        await this.stateManager.clearAll();
+                        new Notice("🗑️ Confluence Sync: Sync state cleared. Next sync will treat all files as new. Use \"Undo reset sync state\" to restore.");
+                    }
+                ).open();
+            },
+        });
+
+        this.addCommand({
+            id: "confluence-undo-reset-sync-state",
+            name: "Undo reset sync state (restore previous mapping)",
+            callback: async () => {
+                const timestamp = await this.stateManager.getLastBackupTimestamp();
+                if (!timestamp) {
+                    new Notice("⚠️ Confluence Sync: No backup available to restore.");
+                    return;
+                }
+                new ConfirmModal(
+                    this.app,
+                    "Restore previous sync state?",
+                    `This will restore the sync mapping as it was before the last reset (backed up at ${timestamp}), ` +
+                        `overwriting the current mapping. Any syncs that happened since the reset will no longer be reflected ` +
+                        `in the restored state.`,
+                    "Restore mapping",
+                    async () => {
+                        const restored = await this.stateManager.restoreLastBackup();
+                        if (restored) {
+                            new Notice("✅ Confluence Sync: Previous sync mapping restored.");
+                        } else {
+                            new Notice("⚠️ Confluence Sync: No backup available to restore.");
+                        }
+                    }
+                ).open();
             },
         });
 
@@ -124,19 +166,30 @@ export default class ConfluenceSyncPlugin extends Plugin {
                     new Notice("⚠️ Confluence Sync: Plugin not configured.");
                     return;
                 }
-                const engine = new SyncEngine(
-                    this.app.vault,
-                    client,
-                    this.stateManager,
-                    this.settings
-                );
-                const deleted = await engine.deleteUnmanagedLocalFiles();
-                if (deleted.length === 0) {
-                    new Notice("✅ Confluence Sync: No unmanaged local files found.");
-                } else {
-                    new Notice(`🗑️ Confluence Sync: Deleted ${deleted.length} unmanaged file(s). Check console for details.`);
-                    console.log("[ConfluenceSync] Deleted unmanaged files:", deleted);
-                }
+                new ConfirmModal(
+                    this.app,
+                    "Delete unmanaged local files?",
+                    `This will permanently delete any local .md file under "${this.settings.vaultDirectory}" that has no ` +
+                        `matching Confluence sync record. This is intended to clean up leftovers from a bad pull, but it will ` +
+                        `also delete any legitimate file that isn't currently tracked (e.g. right after a sync-state reset). ` +
+                        `This action cannot be undone.`,
+                    "Delete unmanaged files",
+                    async () => {
+                        const engine = new SyncEngine(
+                            this.app.vault,
+                            client,
+                            this.stateManager,
+                            this.settings
+                        );
+                        const deleted = await engine.deleteUnmanagedLocalFiles();
+                        if (deleted.length === 0) {
+                            new Notice("✅ Confluence Sync: No unmanaged local files found.");
+                        } else {
+                            new Notice(`🗑️ Confluence Sync: Deleted ${deleted.length} unmanaged file(s). Check console for details.`);
+                            console.log("[ConfluenceSync] Deleted unmanaged files:", deleted);
+                        }
+                    }
+                ).open();
             },
         });
 
@@ -414,6 +467,57 @@ export default class ConfluenceSyncPlugin extends Plugin {
             new Notice(`❌ Pull failed: ${e}`);
         }
     }}
+
+// ── Confirmation modal for destructive actions ─────────────────────────────
+
+class ConfirmModal extends Modal {
+    private title: string;
+    private message: string;
+    private confirmLabel: string;
+    private onConfirm: () => void | Promise<void>;
+
+    constructor(
+        app: App,
+        title: string,
+        message: string,
+        confirmLabel: string,
+        onConfirm: () => void | Promise<void>
+    ) {
+        super(app);
+        this.title = title;
+        this.message = message;
+        this.confirmLabel = confirmLabel;
+        this.onConfirm = onConfirm;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: this.title });
+        contentEl.createEl("p", { text: this.message });
+
+        const buttonRow = contentEl.createDiv({ cls: "confluence-sync-confirm-buttons" });
+        buttonRow.style.display = "flex";
+        buttonRow.style.justifyContent = "flex-end";
+        buttonRow.style.gap = "8px";
+        buttonRow.style.marginTop = "16px";
+
+        const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+        cancelButton.addEventListener("click", () => this.close());
+
+        const confirmButton = buttonRow.createEl("button", {
+            text: this.confirmLabel,
+            cls: "mod-warning",
+        });
+        confirmButton.addEventListener("click", async () => {
+            this.close();
+            await this.onConfirm();
+        });
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
 
 // ── Error detail modal ─────────────────────────────────────────────────────
 
