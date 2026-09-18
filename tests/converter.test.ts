@@ -37,6 +37,38 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).not.toContain("<code><iframe></code>");
     });
 
+    it("converts double-backtick inline code (content may contain a literal backtick)", () => {
+        const result = markdownToConfluenceStorage("see ``converter-lambda-runtime`` please");
+        expect(result).toContain("<code>converter-lambda-runtime</code>");
+        expect(result).toContain("please");
+        expect(result).not.toContain("<ac:structured-macro");
+    });
+
+    it("converts quadruple-backtick inline code without swallowing later content", () => {
+        const md = "- ````ORGID1234````  for factory-test-cam\n- second bullet";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<code>ORGID1234</code>");
+        expect(result).toContain("second bullet");
+        expect(result).not.toContain("<ac:structured-macro");
+    });
+
+    it("does not let a multi-backtick inline span consume a later real fenced code block", () => {
+        const md = "- ````ORGID1234```` inline\n\n```bash\necho hi\n```";
+        const result = markdownToConfluenceStorage(md);
+        expect(result).toContain("<code>ORGID1234</code>");
+        // The real fenced block must still become its own code macro, not be
+        // absorbed as literal text inside the inline span's match.
+        expect(result).toContain('ac:name="code"');
+        expect(result).toContain("<![CDATA[echo hi");
+    });
+
+    it("leaves an unmatched backtick run as literal text", () => {
+        const result = markdownToConfluenceStorage("a stray `` backtick pair with `` closing text");
+        // Both `` pairs are matched as a code span (no unmatched-run case here);
+        // this just documents that mismatched-length runs fall through safely.
+        expect(result).not.toContain("<ac:structured-macro");
+    });
+
     it("converts fenced code blocks to Confluence code macro", () => {
         const md = "```python\nprint('hi')\n```";
         const result = markdownToConfluenceStorage(md);

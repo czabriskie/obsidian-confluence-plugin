@@ -1673,7 +1673,19 @@ export class SyncEngine {
                 const payload = JSON.stringify({ code, mermaid: { theme: "default" } });
                 const encoded = Buffer.from(payload, "utf-8").toString("base64url");
                 const url = `https://mermaid.ink/img/${encoded}?type=png`;
-                const response = await requestUrl({ url, method: "GET" });
+                // mermaid.ink sits behind Cloudflare, which blocks requests that don't
+                // look like they come from a real browser (no User-Agent/Accept →
+                // 403 "error code: 1010"). Obsidian's requestUrl sends no headers by
+                // default, so we spoof a browser UA here to avoid being bot-blocked.
+                const response = await requestUrl({
+                    url,
+                    method: "GET",
+                    headers: {
+                        "User-Agent":
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        Accept: "image/png,*/*",
+                    },
+                });
                 if (response.status !== 200) {
                     console.error(`[ConfluenceSync] Mermaid render failed (${response.status}) for ${filename}`);
                     continue;

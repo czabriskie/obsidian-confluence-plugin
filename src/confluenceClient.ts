@@ -342,13 +342,17 @@ export class ConfluenceClient {
         const https = require("https") as typeof import("https");
         const { URL } = require("url") as typeof import("url");
 
-        // Check if the attachment already exists so we can PUT (update) instead
-        // of POST (create), avoiding 409 "already exists" errors.
+        // Check if the attachment already exists so we hit the .../data
+        // endpoint (update) instead of the base endpoint (create), avoiding
+        // 409 "already exists" errors. Both Confluence Cloud and Server/DC
+        // only accept POST on these endpoints — PUT returns 405 Method Not
+        // Allowed even for the "update" .../data endpoint, despite that
+        // being the intuitive REST-ful choice.
         const existingId = await this.getAttachmentId(pageId, filename);
         const path = existingId
             ? `${this.baseUrl}/rest/api/content/${pageId}/child/attachment/${existingId}/data`
             : `${this.baseUrl}/rest/api/content/${pageId}/child/attachment`;
-        const method = existingId ? "PUT" : "POST";
+        const method = "POST";
 
         const endpoint = new URL(path);
 

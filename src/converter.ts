@@ -22,6 +22,26 @@ function autoLinkUrls(text: string): string {
     );
 }
 
+/**
+ * Converts CommonMark-style backtick-delimited code spans of any run length
+ * (`code`, ``code``, ````code````, etc.) into an element via `wrap`.
+ *
+ * A naive single-backtick regex (`` /`([^`]+)`/g ``) only matches single
+ * backtick pairs — a double- or quadruple-backtick span (used so the code
+ * text itself can contain literal backticks) causes it to skip the intended
+ * delimiters, then greedily match across unrelated later backticks anywhere
+ * in the document (e.g. a real fenced code block's markers), producing
+ * corrupted/mismatched markup.
+ *
+ * This matches the earliest closing run whose length exactly equals the
+ * opening run's length (and isn't itself part of a longer run), per
+ * CommonMark's code span rule, so any backtick-run length is handled
+ * correctly and unmatched runs are left as literal text.
+ */
+function convertCodeSpans(text: string, wrap: (code: string) => string): string {
+    return text.replace(/(`+)([\s\S]*?)(?<!`)\1(?!`)/g, (_match, _ticks, code) => wrap(code));
+}
+
 /** Escape characters that are invalid in XML text nodes. */
 function escapeXmlText(text: string): string {
     return text
@@ -357,9 +377,12 @@ export function markdownToConfluenceStorage(
             if (body) {
                 body = body
                     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-                    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-                    .replace(/`(.+?)`/g, "<code>$1</code>")
-                    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+                    .replace(/\*(.+?)\*/g, "<em>$1</em>");
+                // Use the same run-length-aware matcher as the main inline-code
+                // pass so multi-backtick spans (``code``, ````code````) inside
+                // callout bodies are handled correctly too.
+                body = convertCodeSpans(body, (code) => `<code>${code}</code>`);
+                body = body.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
             }
             macro += `<ac:rich-text-body><p>${body ? escapeXmlTextNodes(body) : ''}</p></ac:rich-text-body>`;
             
@@ -466,8 +489,13 @@ export function markdownToConfluenceStorage(
     // The opening ``` may appear mid-line (e.g. in a list item like
     // "- CSP errors ```\n...```"), so we allow optional leading text before
     // the opening fence. The leading text is preserved before the macro.
+    // The `(?<!`)`/`(?!`)` guards on the opening fence ensure exactly 3
+    // backticks are matched — otherwise a longer run (e.g. an inline
+    // ````code```` span elsewhere in the same line) would be misread as a
+    // fence, swallowing everything up to the next unrelated closing ``` as
+    // code-block content.
     html = html.replace(
-        /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+        /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*(?<!`)```(?!`)[ \t]*$/gm,
         (_, prefix, langLine, code) => {
             // Use only the first whitespace-delimited token as the language identifier
             const lang = langLine.trim().split(/\s+/)[0] ?? "";
@@ -489,7 +517,12 @@ export function markdownToConfluenceStorage(
 
     // Inline code — escape XML chars so that angle brackets in code spans
     // (e.g. `<iframe>`, `Array<T>`) don't produce invalid XHTML.
-    html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
+    // Wrapped in applyOutsideCdata so backticks that happen to appear inside
+    // an already-converted fenced-code-block's CDATA body (e.g. a shell
+    // command substitution like `date`) are never touched.
+    html = applyOutsideCdata(html, (segment) =>
+        convertCodeSpans(segment, (code) => `<code>${escapeXmlText(code)}</code>`)
+    );
 
     // Bold / Italic / Strikethrough — wrapped in applyOutsideCdata so that
     // content inside code block CDATA sections is never modified.

@@ -364,7 +364,7 @@ var ConfluenceClient = class {
     const { URL } = require("url");
     const existingId = await this.getAttachmentId(pageId, filename);
     const path = existingId ? `${this.baseUrl}/rest/api/content/${pageId}/child/attachment/${existingId}/data` : `${this.baseUrl}/rest/api/content/${pageId}/child/attachment`;
-    const method = existingId ? "PUT" : "POST";
+    const method = "POST";
     const endpoint = new URL(path);
     const boundary = `ConfluenceBoundary${Date.now()}`;
     const CRLF = "\r\n";
@@ -565,6 +565,9 @@ function autoLinkUrls(text) {
     '<a href="$1">$1</a>'
   );
 }
+function convertCodeSpans(text, wrap) {
+  return text.replace(/(`+)([\s\S]*?)(?<!`)\1(?!`)/g, (_match, _ticks, code) => wrap(code));
+}
 function escapeXmlText(text) {
   return text.replace(/&(?![a-zA-Z#]\w{0,6};)/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -744,7 +747,9 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
         macro += `<ac:parameter ac:name="title">${escapeXmlText(title.trim())}</ac:parameter>`;
       }
       if (body) {
-        body = body.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/\*(.+?)\*/g, "<em>$1</em>").replace(/`(.+?)`/g, "<code>$1</code>").replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+        body = body.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/\*(.+?)\*/g, "<em>$1</em>");
+        body = convertCodeSpans(body, (code) => `<code>${code}</code>`);
+        body = body.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
       }
       macro += `<ac:rich-text-body><p>${body ? escapeXmlTextNodes(body) : ""}</p></ac:rich-text-body>`;
       macro += `</ac:structured-macro>`;
@@ -808,7 +813,7 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
     return `<!--mermaid:${encoded}--><ac:image><ri:attachment ri:filename="${filename}"/></ac:image>`;
   });
   html = html.replace(
-    /^([ \t]*(?:[^\n`]*)?)```([^\n]*)\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+    /^([ \t]*(?:[^\n`]*)?)(?<!`)```(?!`)([^\n]*)\n([\s\S]*?)^[ \t]*(?<!`)```(?!`)[ \t]*$/gm,
     (_, prefix, langLine, code) => {
       var _a;
       const lang = (_a = langLine.trim().split(/\s+/)[0]) != null ? _a : "";
@@ -816,7 +821,10 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
     }
   );
   html = applyOutsideCdata(html, convertTables);
-  html = html.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeXmlText(code)}</code>`);
+  html = applyOutsideCdata(
+    html,
+    (segment) => convertCodeSpans(segment, (code) => `<code>${escapeXmlText(code)}</code>`)
+  );
   html = applyOutsideCdata(html, (segment) => {
     segment = segment.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
     segment = segment.replace(/__(.+?)__/g, "<strong>$1</strong>");
@@ -2490,7 +2498,14 @@ var SyncEngine = class _SyncEngine {
         const payload = JSON.stringify({ code, mermaid: { theme: "default" } });
         const encoded = Buffer.from(payload, "utf-8").toString("base64url");
         const url = `https://mermaid.ink/img/${encoded}?type=png`;
-        const response = await (0, import_obsidian3.requestUrl)({ url, method: "GET" });
+        const response = await (0, import_obsidian3.requestUrl)({
+          url,
+          method: "GET",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            Accept: "image/png,*/*"
+          }
+        });
         if (response.status !== 200) {
           console.error(`[ConfluenceSync] Mermaid render failed (${response.status}) for ${filename}`);
           continue;
