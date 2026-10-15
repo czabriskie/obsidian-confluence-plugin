@@ -266,6 +266,24 @@ export class ConfluenceClient {
         title: string,
         storageBody: string,
         currentVersion: number,
+        parentId?: string,
+        retriedOnVersionConflict = false
+    ): Promise<ConfluencePage> {
+        try {
+            return await this.updatePageOnce(pageId, title, storageBody, currentVersion, parentId);
+        } catch (e: any) {
+            // The page was edited between our read and write; retry once on its latest version.
+            if (retriedOnVersionConflict || !String(e).includes("Version must be incremented")) throw e;
+            const latest = await this.getPage(pageId);
+            return this.updatePage(pageId, title, storageBody, latest.version, parentId, true);
+        }
+    }
+
+    private async updatePageOnce(
+        pageId: string,
+        title: string,
+        storageBody: string,
+        currentVersion: number,
         parentId?: string
     ): Promise<ConfluencePage> {
         const body: Record<string, unknown> = {

@@ -339,6 +339,20 @@ describe("markdownToConfluenceStorage", () => {
         expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=123">the page</a>');
     });
 
+    it("resolves table wiki links whose alias pipe is escaped (\\|)", () => {
+        const map = new Map([["decisions/0007-hub", "https://wiki.example.com/pages/viewpage.action?pageId=7"]]);
+        const md = "| Document | Role |\n|---|---|\n| [[Decisions/0007-hub\\|0007]] | Option B |";
+        const result = markdownToConfluenceStorage(md, map);
+        expect(result).toContain('<a href="https://wiki.example.com/pages/viewpage.action?pageId=7">0007</a>');
+    });
+
+    it("escapes bare <placeholder> text in task items and paragraphs", () => {
+        const result = markdownToConfluenceStorage("- [ ] Add python-runtime-<version> topic\n\nText <env> here");
+        expect(result).toContain("python-runtime-&lt;version&gt; topic");
+        expect(result).toContain("Text &lt;env&gt; here");
+        expect(result).not.toContain("<version>");
+    });
+
     it("falls back to plain text for wiki links not in the map", () => {
         const map = new Map([["other page", "https://wiki.example.com/pages/viewpage.action?pageId=999"]]);
         const result = markdownToConfluenceStorage("See [[Unknown Page]] for details", map);

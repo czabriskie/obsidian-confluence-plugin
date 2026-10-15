@@ -62,6 +62,9 @@ export class SyncEngine {
      */
     private _ambiguousBasenames = new Set<string>();
 
+    /** Paths whose "parent/basename" title still collides; maps to a longer unique title. */
+    private _titleOverrides = new Map<string, string>();
+
     constructor(
         private vault: Vault,
         private client: ConfluenceClient,
@@ -518,7 +521,13 @@ export class SyncEngine {
         const remoteHash = SyncStateManager.hash(remotePage.body);
         const remoteChanged = remoteHash !== record.contentHash;
 
-        if (localChanged && remoteChanged) {
+        // Confluence normalises storage XML, so remoteHash rarely matches the hash we
+        // stored. If neither the file nor the remote version changed since the last
+        // sync, the diff comes from a converter change and the local file should win.
+        const converterOnlyChange = file.stat.mtime <= new Date(record.lastSyncedAt).getTime()
+            && remotePage.version === record.confluenceVersion;
+
+        if (localChanged && remoteChanged && !converterOnlyChange) {
             result.conflicts.push(file.path);
             const strategy = this.settings.conflictStrategy;
             if (strategy === "remote") return false;
@@ -1175,6 +1184,8 @@ export class SyncEngine {
     }
 
     private titleFromFile(file: TFile): string {
+        const override = this._titleOverrides.get(file.path);
+        if (override) return override;
         if (this._ambiguousBasenames.has(file.basename)) {
             // Multiple files share this basename across different directories.
             // Waypoint files have the same name as their containing directory
@@ -1193,6 +1204,41 @@ export class SyncEngine {
         return file.basename;
     }
 
+    /**
+     * When "parent/basename" (or the plain waypoint basename) is still shared by
+     * several files, prepend further ancestor folders until each title is unique.
+     */
+    private computeTitleOverrides(files: TFile[], ambiguous: Set<string>): Map<string, string> {
+        const baseTitle = (f: TFile) => {
+            if (!ambiguous.has(f.basename)) return f.basename;
+            const parent = f.path.split("/").slice(-2, -1)[0] ?? "";
+            return parent && parent !== f.basename ? `${parent}/${f.basename}` : f.basename;
+        };
+        const overrides = new Map<string, string>();
+        const byTitle = new Map<string, TFile[]>();
+        for (const f of files) {
+            const t = baseTitle(f);
+            byTitle.set(t, [...(byTitle.get(t) ?? []), f]);
+        }
+        for (const group of byTitle.values()) {
+            if (group.length < 2) continue;
+            for (const f of group) {
+                const segs = f.path.replace(/\.[^.]+$/, "").split("/");
+                if (segs[segs.length - 1] === segs[segs.length - 2]) segs.pop();
+                for (let depth = 2; depth <= segs.length; depth++) {
+                    const candidate = segs.slice(-depth).join("/");
+                    const clash = group.some(o => o !== f && o.path.replace(/\.[^.]+$/, "").endsWith("/" + candidate));
+                    if (!clash || depth === segs.length) {
+                        overrides.set(f.path, candidate);
+                        break;
+                    }
+                }
+            }
+        }
+        if (overrides.size > 0) console.log(`[ConfluenceSync] Title overrides (name collisions):`, [...overrides.entries()]);
+        return overrides;
+    }
+
     /** Returns the set of basenames that appear in more than one directory. */
     private computeAmbiguousBasenames(files: TFile[]): Set<string> {
         const counts = new Map<string, number>();
@@ -1200,6 +1246,7 @@ export class SyncEngine {
             counts.set(f.basename, (counts.get(f.basename) ?? 0) + 1);
         }
         const ambiguous = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([k]) => k));
+        this._titleOverrides = this.computeTitleOverrides(files, ambiguous);
         if (ambiguous.size > 0) {
             console.log(`[ConfluenceSync] Ambiguous basenames (will be prefixed):`, [...ambiguous]);
         }
@@ -1281,6 +1328,18 @@ export class SyncEngine {
      * it if needed) and return the ID of the immediate parent folder page.
      */
     private async resolveParentId(file: TFile): Promise<string | undefined> {
+        // Each StaleFolderError has already evicted one deleted ancestor; nested
+        // folders can have several deleted ancestors, so keep retrying.
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await this.resolveParentIdOnce(file);
+            } catch (e) {
+                if (!(e instanceof StaleFolderError) || attempt >= 10) throw e;
+            }
+        }
+    }
+
+    private async resolveParentIdOnce(file: TFile): Promise<string | undefined> {
         const rootParentId = this.settings.confluenceParentPageId || undefined;
 
         // Get the sync root folder path (vault-relative)

@@ -148,10 +148,13 @@ function applyOutsideCdata(input: string, fn: (s: string) => string): string {
  */
 function escapeXmlTextNodes(html: string): string {
     // Split on HTML tags, escape only the text segments (even-indexed parts)
+    // Placeholders like <version> or <env> in prose are not real markup; escape them.
     return html.split(/(<[^>]+>)/).map((part, i) =>
-        i % 2 === 0 ? escapeXmlText(part) : part
+        i % 2 === 0 || !KNOWN_TAG_RE.test(part) ? escapeXmlText(part) : part
     ).join("");
 }
+
+const KNOWN_TAG_RE = /^<(?:!--|\/?(?:ac:|ri:)|\/?(?:a|b|i|u|s|em|strong|code|pre|p|br|hr|ul|ol|li|table|thead|tbody|tr|th|td|blockquote|h[1-6]|sub|sup|span|div|img|del|ins|time|details|summary)(?=[\s/>]))/i;
 
 function convertTables(input: string): string {
     // Collect contiguous pipe-delimited lines (ignoring blank lines within the block)
@@ -425,7 +428,9 @@ export function markdownToConfluenceStorage(
         return url ? `<a href="${url}">${escapeXmlText(title)}</a>` : escapeXmlText(title);
     });
     // [[Page|Alias]] / [[Page]] — resolve by page name
-    html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, page, alias) => {
+    html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, rawPage: string, alias) => {
+        // Inside tables Obsidian escapes the alias pipe as "\|", leaving a trailing backslash
+        const page = rawPage.replace(/\\+$/, "");
         // Support path-prefixed links like [[Folder/Page|Alias]] — try full path first, then last segment
         const segments = page.split("/");
         const lastName = segments[segments.length - 1];

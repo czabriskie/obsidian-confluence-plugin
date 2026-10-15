@@ -303,7 +303,16 @@ var ConfluenceClient = class {
     };
   }
   /** Update an existing Confluence page. */
-  async updatePage(pageId, title, storageBody, currentVersion, parentId) {
+  async updatePage(pageId, title, storageBody, currentVersion, parentId, retriedOnVersionConflict = false) {
+    try {
+      return await this.updatePageOnce(pageId, title, storageBody, currentVersion, parentId);
+    } catch (e) {
+      if (retriedOnVersionConflict || !String(e).includes("Version must be incremented")) throw e;
+      const latest = await this.getPage(pageId);
+      return this.updatePage(pageId, title, storageBody, latest.version, parentId, true);
+    }
+  }
+  async updatePageOnce(pageId, title, storageBody, currentVersion, parentId) {
     var _a, _b, _c, _d;
     const body = {
       id: pageId,
@@ -617,9 +626,10 @@ function applyOutsideCdata(input, fn) {
 }
 function escapeXmlTextNodes(html) {
   return html.split(/(<[^>]+>)/).map(
-    (part, i) => i % 2 === 0 ? escapeXmlText(part) : part
+    (part, i) => i % 2 === 0 || !KNOWN_TAG_RE.test(part) ? escapeXmlText(part) : part
   ).join("");
 }
+var KNOWN_TAG_RE = /^<(?:!--|\/?(?:ac:|ri:)|\/?(?:a|b|i|u|s|em|strong|code|pre|p|br|hr|ul|ol|li|table|thead|tbody|tr|th|td|blockquote|h[1-6]|sub|sup|span|div|img|del|ins|time|details|summary)(?=[\s/>]))/i;
 function convertTables(input) {
   return input.replace(
     /((?:^[ \t]*\|.+\|[ \t]*\n?(?:^[ \t]*\n)?)+)/gm,
@@ -780,8 +790,9 @@ function markdownToConfluenceStorage(markdown, titleToUrl = /* @__PURE__ */ new 
     const url = resolveWikiUrl(title);
     return url ? `<a href="${url}">${escapeXmlText(title)}</a>` : escapeXmlText(title);
   });
-  html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, page, alias) => {
+  html = html.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, rawPage, alias) => {
     var _a;
+    const page = rawPage.replace(/\\+$/, "");
     const segments = page.split("/");
     const lastName = segments[segments.length - 1];
     const url = (_a = resolveWikiUrl(page)) != null ? _a : resolveWikiUrl(lastName);
@@ -1287,6 +1298,8 @@ var SyncEngine = class _SyncEngine {
      * Local filenames are never affected — only the Confluence page title.
      */
     __publicField(this, "_ambiguousBasenames", /* @__PURE__ */ new Set());
+    /** Paths whose "parent/basename" title still collides; maps to a longer unique title. */
+    __publicField(this, "_titleOverrides", /* @__PURE__ */ new Map());
   }
   /**
    * Strip git-style conflict markers from content, keeping only the LOCAL
@@ -1626,7 +1639,8 @@ var SyncEngine = class _SyncEngine {
     }
     const remoteHash = SyncStateManager.hash(remotePage.body);
     const remoteChanged = remoteHash !== record.contentHash;
-    if (localChanged && remoteChanged) {
+    const converterOnlyChange = file.stat.mtime <= new Date(record.lastSyncedAt).getTime() && remotePage.version === record.confluenceVersion;
+    if (localChanged && remoteChanged && !converterOnlyChange) {
       result.conflicts.push(file.path);
       const strategy = this.settings.conflictStrategy;
       if (strategy === "remote") return false;
@@ -2120,6 +2134,8 @@ var SyncEngine = class _SyncEngine {
     }
   }
   titleFromFile(file) {
+    const override = this._titleOverrides.get(file.path);
+    if (override) return override;
     if (this._ambiguousBasenames.has(file.basename)) {
       const parts = file.path.split("/");
       const parentDir = parts.length >= 2 ? parts[parts.length - 2] : "";
@@ -2130,6 +2146,42 @@ var SyncEngine = class _SyncEngine {
     }
     return file.basename;
   }
+  /**
+   * When "parent/basename" (or the plain waypoint basename) is still shared by
+   * several files, prepend further ancestor folders until each title is unique.
+   */
+  computeTitleOverrides(files, ambiguous) {
+    var _a;
+    const baseTitle = (f) => {
+      var _a2;
+      if (!ambiguous.has(f.basename)) return f.basename;
+      const parent = (_a2 = f.path.split("/").slice(-2, -1)[0]) != null ? _a2 : "";
+      return parent && parent !== f.basename ? `${parent}/${f.basename}` : f.basename;
+    };
+    const overrides = /* @__PURE__ */ new Map();
+    const byTitle = /* @__PURE__ */ new Map();
+    for (const f of files) {
+      const t = baseTitle(f);
+      byTitle.set(t, [...(_a = byTitle.get(t)) != null ? _a : [], f]);
+    }
+    for (const group of byTitle.values()) {
+      if (group.length < 2) continue;
+      for (const f of group) {
+        const segs = f.path.replace(/\.[^.]+$/, "").split("/");
+        if (segs[segs.length - 1] === segs[segs.length - 2]) segs.pop();
+        for (let depth = 2; depth <= segs.length; depth++) {
+          const candidate = segs.slice(-depth).join("/");
+          const clash = group.some((o) => o !== f && o.path.replace(/\.[^.]+$/, "").endsWith("/" + candidate));
+          if (!clash || depth === segs.length) {
+            overrides.set(f.path, candidate);
+            break;
+          }
+        }
+      }
+    }
+    if (overrides.size > 0) console.log(`[ConfluenceSync] Title overrides (name collisions):`, [...overrides.entries()]);
+    return overrides;
+  }
   /** Returns the set of basenames that appear in more than one directory. */
   computeAmbiguousBasenames(files) {
     var _a;
@@ -2138,6 +2190,7 @@ var SyncEngine = class _SyncEngine {
       counts.set(f.basename, ((_a = counts.get(f.basename)) != null ? _a : 0) + 1);
     }
     const ambiguous = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([k]) => k));
+    this._titleOverrides = this.computeTitleOverrides(files, ambiguous);
     if (ambiguous.size > 0) {
       console.log(`[ConfluenceSync] Ambiguous basenames (will be prefixed):`, [...ambiguous]);
     }
@@ -2199,6 +2252,15 @@ var SyncEngine = class _SyncEngine {
    * it if needed) and return the ID of the immediate parent folder page.
    */
   async resolveParentId(file) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.resolveParentIdOnce(file);
+      } catch (e) {
+        if (!(e instanceof StaleFolderError) || attempt >= 10) throw e;
+      }
+    }
+  }
+  async resolveParentIdOnce(file) {
     var _a, _b;
     const rootParentId = this.settings.confluenceParentPageId || void 0;
     let rootFolder = this.settings.vaultDirectory;

@@ -276,6 +276,14 @@ Run with `npm test` (vitest).
 
 13. **Conflict markers & `stripConflictMarkers()`** — `pushFileDirect` and `pullFileDirect` insert `<<<<<<< LOCAL` / `>>>>>>> CONFLUENCE` markers when remote content differs. After inserting markers, `contentHash` is stored as `hash(remotePage.body)` (not the marked-up content) so the next sync doesn't see a false diff. `stripConflictMarkers()` extracts only the LOCAL portion before re-inserting markers, preventing nested/accumulated conflict blocks.
 
+14. **Title overrides** — `computeTitleOverrides()` in `syncEngine.ts` prepends ancestor folders to a page title until titles are unique space-wide (e.g. `Infineum/Decisions` vs `SaaS/Decisions`); `titleFromFile()` consults `_titleOverrides` first.
+
+15. **Converter-only change guard** — Confluence rewrites storage XML, so the remote hash rarely matches. In `pushFile`, `converterOnlyChange` (local mtime <= lastSyncedAt and remote version == stored version) skips the conflict branch and pushes.
+
+16. **Tag allowlist** — `escapeXmlTextNodes` escapes any `<tag>` not in `KNOWN_TAG_RE` (Confluence `ac:`/`ri:` tags, comments, common HTML) so bare text like `<version>` can't produce invalid XML.
+
+17. **Retries** — `updatePage` retries once on "Version must be incremented" using a freshly fetched version; `resolveParentId` retries up to 10 times on `StaleFolderError` (nested deleted folder pages).
+
 ## Known Bugs
 
 - **Image attachment 409 on re-push** — Uploading an image attachment that already exists on a page can still produce a 409 error in some cases. The `uploadAttachment()` method attempts to detect existing attachments via `getAttachmentId()` and use `PUT .../data` for updates, but this does not always prevent the conflict. Non-blocking: the console logs the error and sync continues.
