@@ -648,7 +648,7 @@ export class SyncEngine {
 
         this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
         const newTitle = this.titleFromFile(file);
-        const newParentId = await this.resolveParentId(file);
+        const newParentId = await this.resolveParentId(file, record.confluencePageId);
 
         try {
             const remotePage = await this.client.getPage(record.confluencePageId);
@@ -695,8 +695,7 @@ export class SyncEngine {
             }
             // Don't swallow other errors silently — leave the old record in place
             // (so this rename can be retried) rather than risking data loss.
-            console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" → "${file.path}":`, e);
-            throw e;
+            throw e; // main.ts logs and shows the Notice
         }
     }
 
@@ -1327,19 +1326,20 @@ export class SyncEngine {
      * For each subfolder segment, ensure a Confluence page exists (creating
      * it if needed) and return the ID of the immediate parent folder page.
      */
-    private async resolveParentId(file: TFile): Promise<string | undefined> {
+    /** `selfPageId` is the file's own page; it must never be returned as its parent. */
+    private async resolveParentId(file: TFile, selfPageId?: string): Promise<string | undefined> {
         // Each StaleFolderError has already evicted one deleted ancestor; nested
         // folders can have several deleted ancestors, so keep retrying.
         for (let attempt = 0; ; attempt++) {
             try {
-                return await this.resolveParentIdOnce(file);
+                return await this.resolveParentIdOnce(file, selfPageId);
             } catch (e) {
                 if (!(e instanceof StaleFolderError) || attempt >= 10) throw e;
             }
         }
     }
 
-    private async resolveParentIdOnce(file: TFile): Promise<string | undefined> {
+    private async resolveParentIdOnce(file: TFile, selfPageId?: string): Promise<string | undefined> {
         const rootParentId = this.settings.confluenceParentPageId || undefined;
 
         // Get the sync root folder path (vault-relative)
@@ -1362,14 +1362,30 @@ export class SyncEngine {
         // e.g. rootFolder = "1 Projects/Confluence"
         //      fileDir     = "1 Projects/Confluence/One on Ones (Jens and Cam)"
         //      segments    = ["One on Ones (Jens and Cam)"]
-        const relativePath = fileDir.slice(rootFolder.length).replace(/^\//, "");
+        const rootPrefix = rootFolder === "/" || rootFolder === "" ? "" : rootFolder + "/";
+        if (rootPrefix && !fileDir.startsWith(rootPrefix)) {
+            return undefined; // outside the sync root: leave the parent unchanged
+        }
+        const relativePath = fileDir.slice(rootPrefix.length);
         const segments = relativePath.split("/").filter(Boolean);
 
         let currentParentId = rootParentId;
         let accumulatedPath = rootFolder;
 
-        for (const segment of segments) {
+        let lastNonSelfId = currentParentId;
+        for (let i = 0; i < segments.length; i++) {
+            const segment = segments[i];
+            // Never let the file's own page become its parent (folder notes double
+            // as their folder's page, so lookups can resolve to the page itself).
+            if (selfPageId && currentParentId === selfPageId) currentParentId = lastNonSelfId;
+            else lastNonSelfId = currentParentId;
             accumulatedPath = normalizePath(`${accumulatedPath}/${segment}`);
+
+            // A folder note's own folder is represented by the note itself.
+            if (selfPageId && i === segments.length - 1 && segment === file.basename) {
+                this.state.setFolder(accumulatedPath, selfPageId);
+                break;
+            }
 
             // Check if we already have a Confluence page for this folder.
             // Prefer the persistent folderMap (pages we created), then the transient
@@ -1476,7 +1492,7 @@ export class SyncEngine {
             console.log(`[ConfluenceSync] Created folder page "${segment}" (${folderPage.id})`);
         }
 
-        return currentParentId;
+        return selfPageId && currentParentId === selfPageId ? lastNonSelfId : currentParentId;
     }
 
     /** Resolve the vault-relative root sync folder. */
@@ -1536,6 +1552,11 @@ export class SyncEngine {
             if (localDir) continue; // directory still exists
 
             const folderId = allFolders[dirPath];
+            // A folder note's page doubles as the folder page and belongs to a tracked file.
+            if (this.state.findByPageId(folderId)) {
+                this.state.deleteFolder(dirPath);
+                continue;
+            }
             console.log(
                 `[ConfluenceSync] Deleting obsolete Confluence folder page (${folderId}) ` +
                 `— local directory removed: ${dirPath}`

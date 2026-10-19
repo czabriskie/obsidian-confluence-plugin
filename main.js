@@ -1736,7 +1736,7 @@ var SyncEngine = class _SyncEngine {
     if (this.vault.getAbstractFileByPath(oldPath)) return;
     this._ambiguousBasenames = this.computeAmbiguousBasenames(await this.collectLocalFiles());
     const newTitle = this.titleFromFile(file);
-    const newParentId = await this.resolveParentId(file);
+    const newParentId = await this.resolveParentId(file, record.confluencePageId);
     try {
       const remotePage = await this.client.getPage(record.confluencePageId);
       const titleChanged = newTitle !== record.confluenceTitle;
@@ -1774,7 +1774,6 @@ var SyncEngine = class _SyncEngine {
         await this.state.save();
         return;
       }
-      console.error(`[ConfluenceSync] Failed to reconcile rename "${oldPath}" \u2192 "${file.path}":`, e);
       throw e;
     }
   }
@@ -2251,16 +2250,17 @@ var SyncEngine = class _SyncEngine {
    * For each subfolder segment, ensure a Confluence page exists (creating
    * it if needed) and return the ID of the immediate parent folder page.
    */
-  async resolveParentId(file) {
+  /** `selfPageId` is the file's own page; it must never be returned as its parent. */
+  async resolveParentId(file, selfPageId) {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.resolveParentIdOnce(file);
+        return await this.resolveParentIdOnce(file, selfPageId);
       } catch (e) {
         if (!(e instanceof StaleFolderError) || attempt >= 10) throw e;
       }
     }
   }
-  async resolveParentIdOnce(file) {
+  async resolveParentIdOnce(file, selfPageId) {
     var _a, _b;
     const rootParentId = this.settings.confluenceParentPageId || void 0;
     let rootFolder = this.settings.vaultDirectory;
@@ -2273,12 +2273,24 @@ var SyncEngine = class _SyncEngine {
     if (fileDir === rootFolder) {
       return rootParentId;
     }
-    const relativePath = fileDir.slice(rootFolder.length).replace(/^\//, "");
+    const rootPrefix = rootFolder === "/" || rootFolder === "" ? "" : rootFolder + "/";
+    if (rootPrefix && !fileDir.startsWith(rootPrefix)) {
+      return void 0;
+    }
+    const relativePath = fileDir.slice(rootPrefix.length);
     const segments = relativePath.split("/").filter(Boolean);
     let currentParentId = rootParentId;
     let accumulatedPath = rootFolder;
-    for (const segment of segments) {
+    let lastNonSelfId = currentParentId;
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      if (selfPageId && currentParentId === selfPageId) currentParentId = lastNonSelfId;
+      else lastNonSelfId = currentParentId;
       accumulatedPath = (0, import_obsidian3.normalizePath)(`${accumulatedPath}/${segment}`);
+      if (selfPageId && i === segments.length - 1 && segment === file.basename) {
+        this.state.setFolder(accumulatedPath, selfPageId);
+        break;
+      }
       const cachedCreated = this.state.getFolder(accumulatedPath);
       if (cachedCreated) {
         currentParentId = cachedCreated;
@@ -2352,7 +2364,7 @@ var SyncEngine = class _SyncEngine {
       currentParentId = folderPage.id;
       console.log(`[ConfluenceSync] Created folder page "${segment}" (${folderPage.id})`);
     }
-    return currentParentId;
+    return selfPageId && currentParentId === selfPageId ? lastNonSelfId : currentParentId;
   }
   /** Resolve the vault-relative root sync folder. */
   resolveSyncRoot() {
@@ -2396,6 +2408,10 @@ var SyncEngine = class _SyncEngine {
       const localDir = this.vault.getAbstractFileByPath(dirPath);
       if (localDir) continue;
       const folderId = allFolders[dirPath];
+      if (this.state.findByPageId(folderId)) {
+        this.state.deleteFolder(dirPath);
+        continue;
+      }
       console.log(
         `[ConfluenceSync] Deleting obsolete Confluence folder page (${folderId}) \u2014 local directory removed: ${dirPath}`
       );
